@@ -40,6 +40,7 @@
 #define IDM_NEWSESS   0x0020
 #define IDM_DUPSESS   0x0030
 #define IDM_RESTART   0x0040
+#define IDM_CLOSERESTART 0x0080
 #define IDM_RECONF    0x0050
 #define IDM_CLRSB     0x0060
 #define IDM_RESET     0x0070
@@ -336,7 +337,16 @@ static void start_backend(WinGuiSeat *wgs)
         DeleteMenu(wgs->popup_menus[i].menu, IDM_RESTART, MF_BYCOMMAND);
     }
 
+    /* Ensure the Close+Restart menu item is present while active. */
+    for (i = 0; i < lenof(wgs->popup_menus); i++) {
+        DeleteMenu(wgs->popup_menus[i].menu, IDM_CLOSERESTART, MF_BYCOMMAND);
+        InsertMenu(wgs->popup_menus[i].menu, IDM_DUPSESS,
+                   MF_BYCOMMAND | MF_ENABLED, IDM_CLOSERESTART,
+                   "Close+&Restart");
+    }
+
     wgs->session_closed = false;
+    wgs->pending_restart = false;
 }
 
 static void close_session(void *vctx)
@@ -367,9 +377,15 @@ static void close_session(void *vctx)
      * delete first to ensure we never end up with more than one.
      */
     for (i = 0; i < lenof(wgs->popup_menus); i++) {
+        DeleteMenu(wgs->popup_menus[i].menu, IDM_CLOSERESTART, MF_BYCOMMAND);
         DeleteMenu(wgs->popup_menus[i].menu, IDM_RESTART, MF_BYCOMMAND);
         InsertMenu(wgs->popup_menus[i].menu, IDM_DUPSESS,
                    MF_BYCOMMAND | MF_ENABLED, IDM_RESTART, "&Restart Session");
+    }
+
+    if (wgs->pending_restart) {
+        wgs->pending_restart = false;
+        PostMessage(wgs->term_hwnd, WM_COMMAND, IDM_RESTART, 0);
     }
 }
 
@@ -2351,6 +2367,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                 start_backend(wgs);
             }
 
+            break;
+          case IDM_CLOSERESTART:
+            if (wgs->backend) {
+                wgs->pending_restart = true;
+                queue_toplevel_callback(close_session, wgs);
+            } else {
+                PostMessage(hwnd, WM_COMMAND, IDM_RESTART, 0);
+            }
             break;
           case IDM_RECONF: {
             Conf *prev_conf;
