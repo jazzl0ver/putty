@@ -78,6 +78,7 @@ struct WinGuiSeat {
 
     struct unicode_data ucsdata;
     bool session_closed;
+    bool pending_restart;
     bool reconfiguring;
 
     const SessionSpecial *specials;
