@@ -1,0 +1,8 @@
+#include "rcstuff.h"
+
+#define APPNAME "PuTTY Launcher"
+#define APPDESC "Session launcher for PuTTY"
+
+200 ICON "putty.ico"
+
+#include "version.rc2"
