@@ -115,6 +115,17 @@ target_link_libraries(putty
 set_target_properties(putty PROPERTIES WIN32_EXECUTABLE ON)
 installed_program(putty)
 
+add_executable(putty-launcher
+  putty-launcher.c
+  putty-launcher.rc
+  nohelp.c
+  launcher_stubs.c)
+target_link_libraries(putty-launcher
+  settings utils comctl32 shell32 advapi32
+  ${platform_libraries})
+set_target_properties(putty-launcher PROPERTIES WIN32_EXECUTABLE ON)
+installed_program(putty-launcher)
+
 add_executable(puttytel
   window.c
   putty.c
