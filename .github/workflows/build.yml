@@ -1,0 +1,58 @@
+name: Build and Release (Windows x64)
+
+on:
+  push:
+    tags:
+      - '*'       # Triggers on any tags
+
+jobs:
+  build-windows:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to create a release and upload assets
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Pull dockcross image
+        run: docker pull dockcross/windows-static-x64:latest
+
+      - name: Generate dockcross script
+        run: |
+          # Generate the dockcross helper script
+          docker run --rm dockcross/windows-static-x64:latest > ./dockcross
+          chmod +x ./dockcross
+
+      - name: Build PuTTY with CMake
+        run: |
+          # Configure the project inside the dockcross container
+          # PuTTY uses CMake as its primary build system in recent versions
+          ./dockcross cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release
+
+          # Execute the build
+          ./dockcross cmake --build build --config Release -j $(nproc)
+
+      - name: Prepare Release Assets
+        run: |
+          mkdir -p release_binaries
+
+          while IFS= read -r binary; do
+            cp "build/${binary}" release_binaries/
+          done < build/shipped.txt
+
+          ls -l release_binaries
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_binaries/*.exe
+          name: PuTTY Release ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
