@@ -28,12 +28,18 @@ static HMODULE shell32_module = NULL;
 DECL_WINDOWS_FUNCTION(static, HRESULT, SHGetFolderPathA,
                       (HWND, int, HANDLE, DWORD, LPSTR));
 
+/* Optional KiTTY-style file storage backend */
+#include "filestore.h"
+
 struct settings_w {
     HKEY sesskey;
 };
 
 settings_w *open_settings_w(const char *sessionname, char **errmsg)
 {
+    if (win_use_file_storage())
+        return fs_open_settings_w(sessionname, errmsg);
+
     *errmsg = NULL;
 
     if (!sessionname || !*sessionname)
@@ -58,18 +64,30 @@ settings_w *open_settings_w(const char *sessionname, char **errmsg)
 
 void write_setting_s(settings_w *handle, const char *key, const char *value)
 {
+    if (win_use_file_storage()) {
+        fs_write_setting_s(handle, key, value);
+        return;
+    }
     if (handle)
         put_reg_sz(handle->sesskey, key, value);
 }
 
 void write_setting_i(settings_w *handle, const char *key, int value)
 {
+    if (win_use_file_storage()) {
+        fs_write_setting_i(handle, key, value);
+        return;
+    }
     if (handle)
         put_reg_dword(handle->sesskey, key, value);
 }
 
 void close_settings_w(settings_w *handle)
 {
+    if (win_use_file_storage()) {
+        fs_close_settings_w(handle);
+        return;
+    }
     close_regkey(handle->sesskey);
     sfree(handle);
 }
@@ -80,6 +98,9 @@ struct settings_r {
 
 settings_r *open_settings_r(const char *sessionname)
 {
+    if (win_use_file_storage())
+        return fs_open_settings_r(sessionname);
+
     if (!sessionname || !*sessionname)
         sessionname = "Default Settings";
 
@@ -98,6 +119,8 @@ settings_r *open_settings_r(const char *sessionname)
 
 char *read_setting_s(settings_r *handle, const char *key)
 {
+    if (win_use_file_storage())
+        return fs_read_setting_s(handle, key);
     if (!handle)
         return NULL;
     return get_reg_sz(handle->sesskey, key);
@@ -105,6 +128,8 @@ char *read_setting_s(settings_r *handle, const char *key)
 
 int read_setting_i(settings_r *handle, const char *key, int defvalue)
 {
+    if (win_use_file_storage())
+        return fs_read_setting_i(handle, key, defvalue);
     DWORD val;
     if (!handle || !get_reg_dword(handle->sesskey, key, &val))
         return defvalue;
@@ -114,6 +139,8 @@ int read_setting_i(settings_r *handle, const char *key, int defvalue)
 
 FontSpec *read_setting_fontspec(settings_r *handle, const char *name)
 {
+    if (win_use_file_storage())
+        return fs_read_setting_fontspec(handle, name);
     char *settingname;
     char *fontname;
     FontSpec *ret;
@@ -155,6 +182,10 @@ FontSpec *read_setting_fontspec(settings_r *handle, const char *name)
 void write_setting_fontspec(settings_w *handle,
                             const char *name, FontSpec *font)
 {
+    if (win_use_file_storage()) {
+        fs_write_setting_fontspec(handle, name, font);
+        return;
+    }
     char *settingname;
 
     write_setting_s(handle, name, font->name);
@@ -171,6 +202,8 @@ void write_setting_fontspec(settings_w *handle,
 
 Filename *read_setting_filename(settings_r *handle, const char *name)
 {
+    if (win_use_file_storage())
+        return fs_read_setting_filename(handle, name);
     char *tmp = read_setting_s(handle, name);
     if (tmp) {
         Filename *ret = filename_from_str(tmp);
@@ -183,6 +216,10 @@ Filename *read_setting_filename(settings_r *handle, const char *name)
 void write_setting_filename(settings_w *handle,
                             const char *name, Filename *result)
 {
+    if (win_use_file_storage()) {
+        fs_write_setting_filename(handle, name, result);
+        return;
+    }
     /*
      * When saving a session involving a Filename, we use the 'cpath'
      * member of the Filename structure, because otherwise we break
@@ -204,6 +241,10 @@ void write_setting_filename(settings_w *handle,
 
 void close_settings_r(settings_r *handle)
 {
+    if (win_use_file_storage()) {
+        fs_close_settings_r(handle);
+        return;
+    }
     if (handle) {
         close_regkey(handle->sesskey);
         sfree(handle);
@@ -212,6 +253,10 @@ void close_settings_r(settings_r *handle)
 
 void del_settings(const char *sessionname)
 {
+    if (win_use_file_storage()) {
+        fs_del_settings(sessionname);
+        return;
+    }
     HKEY rkey = open_regkey_rw(HKEY_CURRENT_USER, puttystr);
     if (!rkey)
         return;
@@ -233,6 +278,9 @@ struct settings_e {
 
 settings_e *enum_settings_start(void)
 {
+    if (win_use_file_storage())
+        return fs_enum_settings_start();
+
     HKEY key = open_regkey_ro(HKEY_CURRENT_USER, puttystr);
     if (!key)
         return NULL;
@@ -248,6 +296,8 @@ settings_e *enum_settings_start(void)
 
 bool enum_settings_next(settings_e *e, strbuf *sb)
 {
+    if (win_use_file_storage())
+        return fs_enum_settings_next(e, sb);
     char *name = enum_regkey(e->key, e->i);
     if (!name)
         return false;
@@ -260,6 +310,10 @@ bool enum_settings_next(settings_e *e, strbuf *sb)
 
 void enum_settings_finish(settings_e *e)
 {
+    if (win_use_file_storage()) {
+        fs_enum_settings_finish(e);
+        return;
+    }
     close_regkey(e->key);
     sfree(e);
 }
@@ -274,6 +328,8 @@ static void hostkey_regname(strbuf *sb, const char *hostname,
 int check_stored_host_key(const char *hostname, int port,
                           const char *keytype, const char *key)
 {
+    if (win_use_file_storage())
+        return fs_check_stored_host_key(hostname, port, keytype, key);
     /*
      * Read a saved key in from the registry and see what it says.
      */
@@ -376,6 +432,10 @@ bool have_ssh_host_key(const char *hostname, int port,
 void store_host_key(Seat *seat, const char *hostname, int port,
                     const char *keytype, const char *key)
 {
+    if (win_use_file_storage()) {
+        fs_store_host_key(seat, hostname, port, keytype, key);
+        return;
+    }
     strbuf *regname = strbuf_new();
     hostkey_regname(regname, hostname, port, keytype);
 
@@ -396,6 +456,8 @@ struct host_ca_enum {
 
 host_ca_enum *enum_host_ca_start(void)
 {
+    if (win_use_file_storage())
+        return fs_enum_host_ca_start();
     host_ca_enum *e;
     HKEY key;
 
@@ -411,6 +473,8 @@ host_ca_enum *enum_host_ca_start(void)
 
 bool enum_host_ca_next(host_ca_enum *e, strbuf *sb)
 {
+    if (win_use_file_storage())
+        return fs_enum_host_ca_next(e, sb);
     char *regbuf = enum_regkey(e->key, e->i);
     if (!regbuf)
         return false;
@@ -423,12 +487,18 @@ bool enum_host_ca_next(host_ca_enum *e, strbuf *sb)
 
 void enum_host_ca_finish(host_ca_enum *e)
 {
+    if (win_use_file_storage()) {
+        fs_enum_host_ca_finish(e);
+        return;
+    }
     close_regkey(e->key);
     sfree(e);
 }
 
 host_ca *host_ca_load(const char *name)
 {
+    if (win_use_file_storage())
+        return fs_host_ca_load(name);
     strbuf *sb;
     const char *s;
 
@@ -477,6 +547,8 @@ host_ca *host_ca_load(const char *name)
 
 char *host_ca_save(host_ca *hca)
 {
+    if (win_use_file_storage())
+        return fs_host_ca_save(hca);
     if (!*hca->name)
         return dupstr("CA record must have a name");
 
@@ -511,6 +583,8 @@ char *host_ca_save(host_ca *hca)
 
 char *host_ca_delete(const char *name)
 {
+    if (win_use_file_storage())
+        return fs_host_ca_delete(name);
     HKEY rkey = open_regkey_rw(HKEY_CURRENT_USER, host_ca_key);
     if (!rkey)
         return NULL;
@@ -664,6 +738,11 @@ static HANDLE access_random_seed(int action)
 
 void read_random_seed(noise_consumer_t consumer)
 {
+    if (win_use_file_storage()) {
+        fs_read_random_seed(consumer);
+        return;
+    }
+
     HANDLE seedf = access_random_seed(OPEN_R);
 
     if (seedf != INVALID_HANDLE_VALUE) {
@@ -682,6 +761,11 @@ void read_random_seed(noise_consumer_t consumer)
 
 void write_random_seed(void *data, int len)
 {
+    if (win_use_file_storage()) {
+        fs_write_random_seed(data, len);
+        return;
+    }
+
     HANDLE seedf = access_random_seed(OPEN_W);
 
     if (seedf != INVALID_HANDLE_VALUE) {
@@ -813,6 +897,13 @@ static void registry_recursive_remove(HKEY key)
 
 void cleanup_all(void)
 {
+    if (win_use_file_storage()) {
+        fs_cleanup_all();
+        /* still clear jump list for tidiness */
+        clear_jumplist();
+        return;
+    }
+
     /* ------------------------------------------------------------
      * Wipe out the random seed file, in all of its possible
      * locations.
