@@ -7588,10 +7588,10 @@ int format_arrow_key(char *buf, Terminal *term, int xkey,
             break;
         }
 
-        if (app_flg)
-            p += sprintf(p, "\x1BO%c", xkey);
-        else if (bitmap)
+        if (bitmap)
             p += sprintf(p, "\x1B[1;%d%c", bitmap, xkey);
+        else if (app_flg)
+            p += sprintf(p, "\x1BO%c", xkey);
         else
             p += sprintf(p, "\x1B[%c", xkey);
     }
