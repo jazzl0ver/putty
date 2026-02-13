@@ -747,7 +747,7 @@ void test_simple(void)
                         FUNKY_VT400, 3, FUNKY_VT100P, 4, FUNKY_SCO, 5,
                         FUNKY_XTERM_216, 6, -1);
     test_int_translated(CONF_sharrow_type, "ShiftedArrowKeys",
-                        SHARROW_APPLICATION,
+                        SHARROW_BITMAP,
                         SHARROW_APPLICATION, 0, SHARROW_BITMAP, 1, -1);
     test_bool_simple(CONF_no_applic_c, "NoApplicationCursors", false);
     test_bool_simple(CONF_no_applic_k, "NoApplicationKeys", false);

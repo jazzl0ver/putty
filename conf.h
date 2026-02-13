@@ -545,7 +545,7 @@ CONF_OPTION(funky_type,
 )
 CONF_OPTION(sharrow_type,
     VALUE_TYPE(INT),
-    DEFAULT_INT(SHARROW_APPLICATION),
+    DEFAULT_INT(SHARROW_BITMAP),
     SAVE_KEYWORD("ShiftedArrowKeys"),
     STORAGE_ENUM(sharrow_type),
 )
