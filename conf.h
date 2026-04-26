@@ -32,6 +32,11 @@ CONF_OPTION(host,
     DEFAULT_STR(""),
     SAVE_KEYWORD("HostName"),
 )
+CONF_OPTION(session_name, /* loaded saved-session name, if any */
+    VALUE_TYPE(STR),
+    DEFAULT_STR(""),
+    NOT_SAVED,
+)
 CONF_OPTION(port,
     VALUE_TYPE(INT),
     SAVE_KEYWORD("PortNumber"),
@@ -817,6 +822,11 @@ CONF_OPTION(win_name_always,
     DEFAULT_BOOL(true),
     SAVE_KEYWORD("WinNameAlways"),
 )
+CONF_OPTION(save_window_pos,
+    VALUE_TYPE(BOOL),
+    DEFAULT_BOOL(true),
+    SAVE_KEYWORD("SaveWindowPos"),
+)
 CONF_OPTION(width,
     VALUE_TYPE(INT),
     DEFAULT_INT(80),
@@ -826,6 +836,16 @@ CONF_OPTION(height,
     VALUE_TYPE(INT),
     DEFAULT_INT(24),
     SAVE_KEYWORD("TermHeight"),
+)
+CONF_OPTION(window_xpos,
+    VALUE_TYPE(INT),
+    DEFAULT_INT(-1),
+    SAVE_KEYWORD("TermXPos"),
+)
+CONF_OPTION(window_ypos,
+    VALUE_TYPE(INT),
+    DEFAULT_INT(-1),
+    SAVE_KEYWORD("TermYPos"),
 )
 CONF_OPTION(font,
     VALUE_TYPE(FONT),

@@ -118,6 +118,7 @@ static void setup_clipboards(Terminal *, Conf *);
 
 /* Window layout information */
 static void reset_window(WinGuiSeat *wgs, int reinit);
+static void save_window_pos_from_hwnd(WinGuiSeat *wgs);
 
 static void flash_window(WinGuiSeat *wgs, int mode);
 static void sys_cursor_update(WinGuiSeat *wgs);
@@ -562,6 +563,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     {
         int winmode = WS_OVERLAPPEDWINDOW | WS_VSCROLL;
         int exwinmode = 0;
+        int initial_x = CW_USEDEFAULT, initial_y = CW_USEDEFAULT;
         const struct BackendVtable *vt =
             backend_vt_from_proto(be_default_protocol);
         bool resize_forbidden = false;
@@ -579,6 +581,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
             exwinmode |= WS_EX_TOPMOST;
         if (conf_get_bool(wgs->conf, CONF_sunken_edge))
             exwinmode |= WS_EX_CLIENTEDGE;
+        if (conf_get_int(wgs->conf, CONF_window_xpos) != -1 &&
+            conf_get_int(wgs->conf, CONF_window_ypos) != -1) {
+            initial_x = conf_get_int(wgs->conf, CONF_window_xpos);
+            initial_y = conf_get_int(wgs->conf, CONF_window_ypos);
+        }
 
 #ifdef TEST_ANSI_WINDOW
         /* For developer testing of ANSI window support, pretend
@@ -592,7 +599,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
         sw_DefWindowProc = DefWindowProcW;
         wgs->term_hwnd = CreateWindowExW(
             exwinmode, terminal_window_class_w(), uappname,
-            winmode, CW_USEDEFAULT, CW_USEDEFAULT,
+            winmode, initial_x, initial_y,
             guess_width, guess_height, NULL, NULL, inst, NULL);
 #endif
 
@@ -606,7 +613,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
             sw_DefWindowProc = DefWindowProcA;
             wgs->term_hwnd = CreateWindowExA(
                 exwinmode, terminal_window_class_a(), appname,
-                winmode, CW_USEDEFAULT, CW_USEDEFAULT,
+                winmode, initial_x, initial_y,
                 guess_width, guess_height, NULL, NULL, inst, NULL);
         }
 #endif
@@ -2126,6 +2133,7 @@ static void exit_callback(void *vctx)
          * appropriate action. */
         if (close_on_exit == FORCE_ON ||
             (close_on_exit == AUTO && exitcode != INT_MAX)) {
+            save_window_pos_from_hwnd(wgs);
             PostQuitMessage(0);
         } else {
             queue_toplevel_callback(close_session, wgs);
@@ -2210,6 +2218,24 @@ static void wm_size_resize_term(WinGuiSeat *wgs, LPARAM lParam)
     conf_set_int(wgs->conf, CONF_width, w);
 }
 
+static void save_window_pos_from_hwnd(WinGuiSeat *wgs)
+{
+    RECT r;
+    WINDOWPLACEMENT wp;
+
+    wp.length = sizeof(wp);
+    if ((IsIconic(wgs->term_hwnd) || IsZoomed(wgs->term_hwnd)) &&
+        GetWindowPlacement(wgs->term_hwnd, &wp))
+        r = wp.rcNormalPosition;
+    else if (!GetWindowRect(wgs->term_hwnd, &r))
+        return;
+
+    save_window_pos_settings(
+        wgs->conf, r.left, r.top,
+        conf_get_int(wgs->conf, CONF_width),
+        conf_get_int(wgs->conf, CONF_height));
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                                 WPARAM wParam, LPARAM lParam)
 {
@@ -2243,6 +2269,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
       }
       case WM_DESTROY:
         show_mouseptr(wgs, true);
+        save_window_pos_from_hwnd(wgs);
         PostQuitMessage(0);
         return 0;
       case WM_INITMENUPOPUP:
@@ -3040,6 +3067,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
         break;
       case WM_MOVE:
         term_notify_window_pos(wgs->term, LOWORD(lParam), HIWORD(lParam));
+        {
+            RECT r;
+            if (GetWindowRect(hwnd, &r)) {
+                conf_set_int(wgs->conf, CONF_window_xpos, r.left);
+                conf_set_int(wgs->conf, CONF_window_ypos, r.top);
+            }
+        }
         sys_cursor_update(wgs);
         break;
       case WM_SIZE:

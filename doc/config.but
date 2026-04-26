@@ -1177,6 +1177,12 @@ terminated can always be closed without a warning.
 If you want to be able to close a window quickly, you can disable
 the \q{Warn before closing window} option.
 
+\S{config-savewindowpos} \q{Save position and size on exit}
+
+If this option is enabled, PuTTY will update the saved session with
+the terminal window's latest position and size when the window closes.
+The size is saved as the terminal's columns and rows.
+
 \S{config-altf4} \q{Window closes on \i{ALT-F4}}
 
 By default, pressing ALT-F4 causes the \I{closing window}window to

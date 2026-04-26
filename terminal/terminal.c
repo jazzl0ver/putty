@@ -103,6 +103,9 @@ static void parse_optionalrgb(optionalrgb *out, unsigned *values);
 static void term_added_data(Terminal *term, bool);
 static void term_update_raw_mouse_mode(Terminal *term);
 static void term_out_cb(void *);
+static void format_forwarded_ports(strbuf *out, Conf *conf, bool dynamic);
+static char *format_window_title(Terminal *term, const char *pattern,
+                                 const char *title_hostname);
 
 static termline *newtermline(Terminal *term, int cols, bool bce)
 {
@@ -1765,7 +1768,7 @@ void term_reconfig(Terminal *term, Conf *conf)
         const char *new_title = conf_get_str(conf, CONF_wintitle);
         if (strcmp(old_title, new_title)) {
             sfree(term->window_title);
-            term->window_title = dupstr(new_title);
+            term->window_title = format_window_title(term, new_title, NULL);
             term->wintitle_codepage = DEFAULT_CODEPAGE;
             term->win_title_pending = true;
             term_schedule_update(term);
@@ -1900,8 +1903,9 @@ void term_setup_window_titles(Terminal *term, const char *title_hostname)
     sfree(term->window_title);
     sfree(term->icon_title);
     if (*conf_title) {
-        term->window_title = dupstr(conf_title);
-        term->icon_title = dupstr(conf_title);
+        term->window_title = format_window_title(
+            term, conf_title, title_hostname);
+        term->icon_title = dupstr(term->window_title);
     } else {
         if (title_hostname && *title_hostname)
             term->window_title = dupcat(title_hostname, " - ", appname);
@@ -1912,6 +1916,127 @@ void term_setup_window_titles(Terminal *term, const char *title_hostname)
     term->wintitle_codepage = term->icontitle_codepage = DEFAULT_CODEPAGE;
     term->win_title_pending = true;
     term->win_icon_title_pending = true;
+}
+
+static void format_forwarded_ports(strbuf *out, Conf *conf, bool dynamic)
+{
+    bool first = true;
+    char *key, *val;
+
+    for (val = conf_get_str_strs(conf, CONF_portfwd, NULL, &key);
+         val != NULL;
+         val = conf_get_str_strs(conf, CONF_portfwd, key, &key)) {
+        bool is_dynamic = !strcmp(val, "D");
+        const char *L = strchr(key, 'L');
+
+        if (!L || is_dynamic != dynamic)
+            continue;
+
+        if (!first)
+            put_datapl(out, PTRLEN_LITERAL(", "));
+        first = false;
+
+        if (dynamic) {
+            put_data(out, key, L - key);
+            put_byte(out, 'D');
+            put_dataz(out, L + 1);
+        } else {
+            put_dataz(out, key);
+        }
+    }
+}
+
+static char *format_window_title(
+    Terminal *term, const char *pattern, const char *title_hostname)
+{
+    strbuf *out = strbuf_new();
+    const BackendVtable *vt = backend_vt_from_proto(
+        conf_get_int(term->conf, CONF_protocol));
+    const char *hostname = conf_dest(term->conf);
+    const char *protocol = vt ? vt->displayname_lc : "";
+    const char *session_name = conf_get_str(term->conf, CONF_session_name);
+    const char *folder_name = "";
+    size_t folder_len = 0;
+    char portbuf[32];
+    char *username = get_remote_username(term->conf);
+    int port = conf_get_int(term->conf, CONF_port);
+
+    if (port <= 0 && vt)
+        port = vt->default_port;
+    snprintf(portbuf, sizeof(portbuf), "%d", port);
+
+    if ((!hostname || !*hostname) && title_hostname && *title_hostname)
+        hostname = title_hostname;
+
+    if (session_name && *session_name) {
+        const char *slash = strrchr(session_name, '/');
+        const char *bslash = strrchr(session_name, '\\');
+        const char *sep = (slash && (!bslash || slash > bslash)) ? slash : bslash;
+
+        if (sep && sep > session_name) {
+            folder_name = session_name;
+            folder_len = sep - session_name;
+        }
+    }
+
+    for (const char *p = pattern; *p; p++) {
+        if (*p != '%') {
+            put_byte(out, *p);
+            continue;
+        }
+
+        if (p[1] != '%') {
+            put_byte(out, '%');
+            continue;
+        }
+
+        p += 2;
+        if (!*p) {
+            put_byte(out, '%');
+            break;
+        }
+
+        switch (*p) {
+          case 'f':
+          case 'F':
+            if (folder_len)
+                put_data(out, folder_name, folder_len);
+            break;
+          case 'h':
+          case 'H':
+            put_dataz(out, hostname ? hostname : "");
+            break;
+          case 'p':
+            put_dataz(out, portbuf);
+            break;
+          case 'P':
+            put_dataz(out, protocol);
+            break;
+          case 's':
+          case 'S':
+            put_dataz(out, session_name ? session_name : "");
+            break;
+          case 'u':
+          case 'U':
+            put_dataz(out, username ? username : "");
+            break;
+          case 'l':
+          case 'L':
+            format_forwarded_ports(out, term->conf, false);
+            break;
+          case 'd':
+          case 'D':
+            format_forwarded_ports(out, term->conf, true);
+            break;
+          default:
+            put_byte(out, '%');
+            p--;
+            break;
+        }
+    }
+
+    sfree(username);
+    return strbuf_to_str(out);
 }
 
 static void palette_rebuild(Terminal *term)
