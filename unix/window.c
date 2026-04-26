@@ -893,6 +893,10 @@ static gboolean window_configured(
     GtkWidget *widget, GdkEventConfigure *event, gpointer data)
 {
     GtkFrontend *inst = (GtkFrontend *)data;
+    inst->xpos = event->x;
+    inst->ypos = event->y;
+    conf_set_int(inst->conf, CONF_window_xpos, inst->xpos);
+    conf_set_int(inst->conf, CONF_window_ypos, inst->ypos);
     if (inst->term) {
         term_notify_window_pos(inst->term, event->x, event->y);
         term_notify_window_size_pixels(
@@ -2438,6 +2442,9 @@ static void destroy_inst_connection(GtkFrontend *inst)
 static void delete_inst(GtkFrontend *inst)
 {
     int dialog_slot;
+    if (inst->conf)
+        save_window_pos_settings(inst->conf, inst->xpos, inst->ypos,
+                                 inst->width, inst->height);
     for (dialog_slot = 0; dialog_slot < DIALOG_SLOT_LIMIT; dialog_slot++) {
         if (inst->dialogs[dialog_slot]) {
             gtk_widget_destroy(inst->dialogs[dialog_slot]);
@@ -5337,6 +5344,12 @@ void new_session_window(Conf *conf, const char *geometry_string)
             inst->gravity = ((flags & XNegative ? 1 : 0) |
                              (flags & YNegative ? 2 : 0));
         }
+    } else if (conf_get_int(conf, CONF_window_xpos) != -1 &&
+               conf_get_int(conf, CONF_window_ypos) != -1) {
+        inst->xpos = conf_get_int(conf, CONF_window_xpos);
+        inst->ypos = conf_get_int(conf, CONF_window_ypos);
+        inst->gotpos = true;
+        inst->gravity = 0;
     }
 #endif
 
