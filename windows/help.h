@@ -68,6 +68,7 @@ typedef const char *HelpCtx;
 #define WINHELP_CTX_window_scrollback "config-scrollback"
 #define WINHELP_CTX_window_erased "config-erasetoscrollback"
 #define WINHELP_CTX_behaviour_closewarn "config-warnonclose"
+#define WINHELP_CTX_behaviour_save_window_pos "config-savewindowpos"
 #define WINHELP_CTX_behaviour_altf4 "config-altf4"
 #define WINHELP_CTX_behaviour_altspace "config-altspace"
 #define WINHELP_CTX_behaviour_altonly "config-altonly"

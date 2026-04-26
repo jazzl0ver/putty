@@ -2299,6 +2299,28 @@ void setup_config_box(struct controlbox *b, bool midsession,
     ctrl_editbox(s, "Window title:", 't', 100,
                  HELPCTX(appearance_title),
                  conf_editbox_handler, I(CONF_wintitle), ED_STR);
+    ctrl_columns(s, 2, 50, 50);
+    c = ctrl_text(s, "%%f: folder name", HELPCTX(appearance_title));
+    c->column = 0;
+    c = ctrl_text(s, "%%h: host name", HELPCTX(appearance_title));
+    c->column = 1;
+    c = ctrl_text(s, "%%p: port number", HELPCTX(appearance_title));
+    c->column = 0;
+    c = ctrl_text(s, "%%P: protocol name", HELPCTX(appearance_title));
+    c->column = 1;
+    c = ctrl_text(s, "%%s: session name", HELPCTX(appearance_title));
+    c->column = 0;
+    c = ctrl_text(s, "%%u: username", HELPCTX(appearance_title));
+    c->column = 1;
+    c = ctrl_text(s, "%%l: local forwarded ports list",
+                  HELPCTX(appearance_title));
+    c->column = 0;
+    c = ctrl_text(s, "%%d: dynamic forwarded ports list",
+                  HELPCTX(appearance_title));
+    c->column = 1;
+    c = ctrl_text(s, "%%: %", HELPCTX(appearance_title));
+    c->column = 0;
+    ctrl_columns(s, 1, 100);
     ctrl_checkbox(s, "Separate window and icon titles", 'i',
                   HELPCTX(appearance_title),
                   conf_checkbox_handler,
@@ -2308,6 +2330,9 @@ void setup_config_box(struct controlbox *b, bool midsession,
     ctrl_checkbox(s, "Warn before closing window", 'w',
                   HELPCTX(behaviour_closewarn),
                   conf_checkbox_handler, I(CONF_warn_on_close));
+    ctrl_checkbox(s, "Save position and size on exit", 's',
+                  HELPCTX(behaviour_save_window_pos),
+                  conf_checkbox_handler, I(CONF_save_window_pos));
 
     /*
      * The Window/Translation panel.
