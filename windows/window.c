@@ -3293,6 +3293,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
         noise_ultralight(NOISE_SOURCE_KEY, lParam);
 
         /*
+         * Once a session has fully closed, plain Enter restarts it,
+         * matching the quick reopen flow familiar from Kitty.
+         */
+        if (wgs->session_closed && !wgs->backend &&
+            (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+            wParam == VK_RETURN && !is_alt_pressed() &&
+            !(GetKeyState(VK_CONTROL) & 0x8000) &&
+            !(GetKeyState(VK_SHIFT) & 0x8000)) {
+            PostMessage(hwnd, WM_COMMAND, IDM_RESTART, 0);
+            return 0;
+        }
+
+        /*
          * We don't do TranslateMessage since it disassociates the
          * resulting CHAR message from the KEYDOWN that sparked it,
          * which we occasionally don't want. Instead, we process
