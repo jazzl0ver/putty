@@ -97,6 +97,9 @@ static int find_last_nonempty_line(Terminal *, tree234 *);
 static void swap_screen(Terminal *, int, bool, bool);
 static void update_sbar(Terminal *);
 static void deselect(Terminal *);
+static void clipme(Terminal *, pos, pos, bool, bool, const int *, int);
+static void term_out(Terminal *, bool);
+static void sel_spread(Terminal *);
 static void term_print_finish(Terminal *);
 static void scroll(Terminal *, int, int, int, bool);
 static void parse_optionalrgb(optionalrgb *out, unsigned *values);
@@ -3667,9 +3670,78 @@ static inline void term_bracketed_paste_stop(Terminal *term)
     term->bracketed_paste_active = false;
 }
 
+static bool term_input_is_return_key(const void *buf, int len)
+{
+    const char *str = (const char *)buf;
+
+    if (len < 0)
+        len = strlen(str);
+
+    return (len == 1 && (str[0] == '\r' || str[0] == '\n')) ||
+        (len == 2 && str[0] == '\r' && str[1] == '\n');
+}
+
+static bool term_extend_selection_to_bottom_on_return(
+    Terminal *term, const void *buf, int len, bool interactive)
+{
+    pos anchor, endpoint;
+    bool was_selected;
+
+    if (!interactive || !term_input_is_return_key(buf, len))
+        return false;
+    if (term->selstate == NO_SELECTION)
+        return false;
+    if (term->rows <= 0 || term->cols <= 0)
+        return false;
+
+    was_selected = (term->selstate == SELECTED);
+    anchor = was_selected ? term->selstart : term->selanchor;
+    endpoint.y = find_last_nonempty_line(term, term->screen);
+    if (endpoint.y < 0)
+        endpoint.y = term->rows - 1;
+    endpoint.x = term->cols - 1;
+
+    term->selstate = DRAGGING;
+    if (term->seltype == LEXICOGRAPHIC) {
+        if (poslt(endpoint, anchor)) {
+            term->selstart = endpoint;
+            term->selend = anchor;
+        } else {
+            term->selstart = anchor;
+            term->selend = endpoint;
+        }
+        incpos(term->selend);
+    } else {
+        term->selstart.x = min(anchor.x, endpoint.x);
+        term->selend.x = 1 + max(anchor.x, endpoint.x);
+        term->selstart.y = min(anchor.y, endpoint.y);
+        term->selend.y = max(anchor.y, endpoint.y);
+    }
+    sel_spread(term);
+
+    if (was_selected) {
+        clipme(term, term->selstart, term->selend,
+               (term->seltype == RECTANGULAR), false,
+               term->mouse_select_clipboards,
+               term->n_mouse_select_clipboards);
+        term->selstate = SELECTED;
+    }
+
+    term_bracketed_paste_stop(term);
+    term_nopaste(term);
+    term_scroll(term, -1, 0);
+    term_seen_key_event(term);
+    term_out(term, false);
+    term_schedule_update(term);
+    return true;
+}
+
 static inline void term_keyinput_internal(
     Terminal *term, const void *buf, int len, bool interactive)
 {
+    if (term_extend_selection_to_bottom_on_return(term, buf, len, interactive))
+        return;
+
     if (term->srm_echo) {
         /*
          * Implement the terminal-level local echo behaviour that
