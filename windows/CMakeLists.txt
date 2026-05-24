@@ -50,7 +50,7 @@ add_sources_from_current_dir(eventloop
 add_sources_from_current_dir(console
   select-cli.c nohelp.c console.c)
 add_sources_from_current_dir(settings
-  storage.c)
+  storage.c filestore.c)
 add_sources_from_current_dir(network
   network.c handle-socket.c named-pipe-client.c named-pipe-server.c local-proxy.c x11.c)
 add_sources_from_current_dir(sshcommon
@@ -141,6 +141,7 @@ add_executable(puttygen
   noise.c
   no-jump-list.c
   storage.c
+  filestore.c
   help.c
   ${CMAKE_SOURCE_DIR}/sshpubk.c
   ${CMAKE_SOURCE_DIR}/sshrand.c
