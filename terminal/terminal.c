@@ -97,6 +97,9 @@ static int find_last_nonempty_line(Terminal *, tree234 *);
 static void swap_screen(Terminal *, int, bool, bool);
 static void update_sbar(Terminal *);
 static void deselect(Terminal *);
+static void clipme(Terminal *, pos, pos, bool, bool, const int *, int);
+static void term_out(Terminal *, bool);
+static void sel_spread(Terminal *);
 static void term_print_finish(Terminal *);
 static void scroll(Terminal *, int, int, int, bool);
 static void parse_optionalrgb(optionalrgb *out, unsigned *values);
@@ -3669,9 +3672,78 @@ static inline void term_bracketed_paste_stop(Terminal *term)
     term->bracketed_paste_active = false;
 }
 
+static bool term_input_is_return_key(const void *buf, int len)
+{
+    const char *str = (const char *)buf;
+
+    if (len < 0)
+        len = strlen(str);
+
+    return (len == 1 && (str[0] == '\r' || str[0] == '\n')) ||
+        (len == 2 && str[0] == '\r' && str[1] == '\n');
+}
+
+static bool term_extend_selection_to_bottom_on_return(
+    Terminal *term, const void *buf, int len, bool interactive)
+{
+    pos anchor, endpoint;
+
+    if (!interactive || !term_input_is_return_key(buf, len))
+        return false;
+    if (!term->return_extends_mouse_selection || term->selstate != SELECTED)
+        return false;
+    if (term->rows <= 0 || term->cols <= 0)
+        return false;
+
+    term->return_extends_mouse_selection = false;
+    anchor = term->selstart;
+    endpoint.y = find_last_nonempty_line(term, term->screen);
+    if (endpoint.y < 0)
+        endpoint.y = term->rows - 1;
+    endpoint.x = term->cols - 1;
+
+    term->selstate = DRAGGING;
+    if (term->seltype == LEXICOGRAPHIC) {
+        if (poslt(endpoint, anchor)) {
+            term->selstart = endpoint;
+            term->selend = anchor;
+        } else {
+            term->selstart = anchor;
+            term->selend = endpoint;
+        }
+        incpos(term->selend);
+    } else {
+        term->selstart.x = min(anchor.x, endpoint.x);
+        term->selend.x = 1 + max(anchor.x, endpoint.x);
+        term->selstart.y = min(anchor.y, endpoint.y);
+        term->selend.y = max(anchor.y, endpoint.y);
+    }
+    sel_spread(term);
+
+    clipme(term, term->selstart, term->selend,
+           (term->seltype == RECTANGULAR), false,
+           term->mouse_select_clipboards,
+           term->n_mouse_select_clipboards);
+    term->selstate = SELECTED;
+
+    term_bracketed_paste_stop(term);
+    term_nopaste(term);
+    term_scroll(term, -1, 0);
+    term_seen_key_event(term);
+    term_out(term, false);
+    term_schedule_update(term);
+    return true;
+}
+
 static inline void term_keyinput_internal(
     Terminal *term, const void *buf, int len, bool interactive)
 {
+    if (term_extend_selection_to_bottom_on_return(term, buf, len, interactive))
+        return;
+
+    if (interactive)
+        term->return_extends_mouse_selection = false;
+
     if (term->srm_echo) {
         /*
          * Implement the terminal-level local echo behaviour that
@@ -6971,6 +7043,8 @@ void term_request_copy(Terminal *term, const int *clipboards, int n_clipboards)
 
 void term_request_paste(Terminal *term, int clipboard)
 {
+    term->return_extends_mouse_selection = false;
+
     switch (clipboard) {
       case CLIP_NULL:
         /* Do nothing: CLIP_NULL never has data in it. */
@@ -7256,6 +7330,7 @@ void term_do_paste(Terminal *term, const wchar_t *data, size_t len)
         sfree(term->paste_buffer);
     term->paste_pos = term->paste_len = 0;
     term->paste_buffer = snewn(len + 12, wchar_t);
+    term->return_extends_mouse_selection = false;
 
     if (term->bracketed_paste && !term->no_bracketed_paste)
         term_bracketed_paste_start(term);
@@ -7628,8 +7703,11 @@ void term_mouse(Terminal *term, Mouse_Button braw, Mouse_Button bcooked,
                    term->mouse_select_clipboards,
                    term->n_mouse_select_clipboards);
             term->selstate = SELECTED;
-        } else
+            term->return_extends_mouse_selection = true;
+        } else {
             term->selstate = NO_SELECTION;
+            term->return_extends_mouse_selection = false;
+        }
     } else if (bcooked == MBT_PASTE
                && (a == MA_CLICK
 #if MULTICLICK_ONLY_EVENT
@@ -7659,8 +7737,10 @@ void term_cancel_selection_drag(Terminal *term)
      * this function from the front end in such situations to restore
      * sensibleness.
      */
-    if (term->selstate == DRAGGING)
+    if (term->selstate == DRAGGING) {
         term->selstate = NO_SELECTION;
+        term->return_extends_mouse_selection = false;
+    }
     term_out(term, false);
     term_schedule_update(term);
 }
@@ -7970,6 +8050,7 @@ static void deselect(Terminal *term)
 {
     term->selstate = NO_SELECTION;
     term->selstart.x = term->selstart.y = term->selend.x = term->selend.y = 0;
+    term->return_extends_mouse_selection = false;
 }
 
 void term_lost_clipboard_ownership(Terminal *term, int clipboard)
