@@ -3954,9 +3954,10 @@ void about_box(void *window)
     {
         char *buildinfo_text = buildinfo("\n");
         char *label_text = dupprintf(
-            "%s\n\n%s\n\n%s\n\n%s",
+            "%s\n\n%s\n\n%s\n\n%s\n%s",
             appname, ver, buildinfo_text,
-            "Copyright " SHORT_COPYRIGHT_DETAILS ". All rights reserved");
+            "Copyright " SHORT_COPYRIGHT_DETAILS ". All rights reserved",
+            PATCHED_BY_DETAILS);
         w = gtk_label_new(label_text);
         gtk_label_set_justify(GTK_LABEL(w), GTK_JUSTIFY_CENTER);
 #if GTK_CHECK_VERSION(2,0,0)

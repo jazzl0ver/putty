@@ -813,6 +813,9 @@ extern const int be_default_protocol;
  */
 extern const char *const appname;
 
+#define PATCHED_BY_DETAILS \
+    "2026: Patched by jazzl0ver (https://github.com/jazzl0ver/putty)"
+
 /*
  * Used by callback.c; declared up here so that prompts_t can use it
  */
