@@ -16,6 +16,7 @@ cmake_install.cmake
 .dirstamp
 .deps
 .DS_Store
+/.vscode
 /*.pdb
 /*.ilk
 /*.res
@@ -68,6 +69,8 @@ cmake_install.cmake
 /*.cnt
 /*.hlp
 /.bmake
+/build/*
+/build-*/*
 /build.log
 /build.out
 /empty.h
