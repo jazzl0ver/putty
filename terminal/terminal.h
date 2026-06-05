@@ -226,7 +226,6 @@ struct terminal_tag {
         SM_CHAR, SM_WORD, SM_LINE
     } selmode;
     pos selstart, selend, selanchor;
-    bool return_extends_mouse_selection; /* one-shot after mouse selection */
 
     short wordness[256];
 
