@@ -63,6 +63,7 @@ typedef struct {
     char *display;    /* "Session" or "Folder" */
     const wchar_t *tag;
     bool is_dir;
+    bool is_host;
 } SessionItem;
 
 typedef struct {
@@ -91,7 +92,13 @@ static void sl_add(SessionList *sl, const char *full_name, const char *display, 
     sl->items[sl->count].display = dupstr(display);
     sl->items[sl->count].tag = tag;
     sl->items[sl->count].is_dir = is_dir;
+    sl->items[sl->count].is_host = false;
     sl->count++;
+}
+
+static void sl_add_host(SessionList *sl, const char *host) {
+    sl_add(sl, host, host, NULL, false);
+    sl->items[sl->count - 1].is_host = true;
 }
 
 static void sl_free(SessionList *sl) {
@@ -120,6 +127,7 @@ static int compare_sessions(const void *a, const void *b) {
     const SessionItem *sa = (const SessionItem *)a;
     const SessionItem *sb = (const SessionItem *)b;
     if (sa->is_dir != sb->is_dir) return sb->is_dir - sa->is_dir;
+    if (sa->is_host != sb->is_host) return sb->is_host - sa->is_host;
     return _stricmp(sa->display, sb->display);
 }
 
@@ -211,6 +219,195 @@ static bool wcsistr(const wchar_t *haystack, const wchar_t *needle) {
         if (CompareStringW(LOCALE_USER_DEFAULT, NORM_IGNORECASE,
                            haystack + i, (int)needle_chars,
                            needle, (int)needle_chars) == CSTR_EQUAL)
+            return true;
+    }
+    return false;
+}
+
+static bool is_search_space(wchar_t ch) {
+    return ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n';
+}
+
+static wchar_t *dup_trimmed_wcs(const wchar_t *text) {
+    const wchar_t *start = text, *end;
+    wchar_t *ret;
+    size_t len;
+
+    while (*start && is_search_space(*start))
+        start++;
+    end = start + wcslen(start);
+    while (end > start && is_search_space(end[-1]))
+        end--;
+
+    len = end - start;
+    ret = snewn(len + 1, wchar_t);
+    memcpy(ret, start, len * sizeof(wchar_t));
+    ret[len] = L'\0';
+    return ret;
+}
+
+static bool is_ascii_digit_w(wchar_t ch) {
+    return ch >= L'0' && ch <= L'9';
+}
+
+static bool is_ascii_alpha_w(wchar_t ch) {
+    return (ch >= L'A' && ch <= L'Z') || (ch >= L'a' && ch <= L'z');
+}
+
+static bool is_ascii_alnum_w(wchar_t ch) {
+    return is_ascii_alpha_w(ch) || is_ascii_digit_w(ch);
+}
+
+static bool is_ascii_hex_w(wchar_t ch) {
+    return is_ascii_digit_w(ch) ||
+        (ch >= L'A' && ch <= L'F') || (ch >= L'a' && ch <= L'f');
+}
+
+static bool is_username_char(wchar_t ch) {
+    return is_ascii_alnum_w(ch) || ch == L'.' || ch == L'_' || ch == L'-';
+}
+
+static bool is_username_text(const wchar_t *text, size_t len) {
+    if (!len)
+        return false;
+    for (size_t i = 0; i < len; i++) {
+        if (!is_username_char(text[i]))
+            return false;
+    }
+    return true;
+}
+
+static bool is_ipv4_address_text(const wchar_t *text) {
+    int parts = 0;
+    const wchar_t *p = text;
+
+    while (*p) {
+        int digits = 0;
+        int value = 0;
+
+        while (is_ascii_digit_w(*p)) {
+            value = value * 10 + (*p - L'0');
+            digits++;
+            if (digits > 3 || value > 255)
+                return false;
+            p++;
+        }
+        if (!digits)
+            return false;
+
+        parts++;
+        if (*p == L'.') {
+            p++;
+            continue;
+        }
+        break;
+    }
+
+    return *p == L'\0' && parts == 4;
+}
+
+static bool is_ipv6_address_text(const wchar_t *text) {
+    bool saw_colon = false, saw_hex = false, prev_colon = false;
+    int chunks = 0, chunk_digits = 0, double_colons = 0;
+
+    for (const wchar_t *p = text; *p; p++) {
+        if (is_ascii_hex_w(*p)) {
+            saw_hex = true;
+            chunk_digits++;
+            if (chunk_digits > 4)
+                return false;
+            prev_colon = false;
+        } else if (*p == L':') {
+            saw_colon = true;
+            if (prev_colon && ++double_colons > 1)
+                return false;
+            if (chunk_digits) {
+                chunks++;
+                chunk_digits = 0;
+            }
+            prev_colon = true;
+        } else {
+            return false;
+        }
+    }
+
+    if (prev_colon && double_colons == 0)
+        return false;
+    if (chunk_digits)
+        chunks++;
+    return saw_colon && saw_hex && chunks <= 8 &&
+        ((double_colons == 1 && chunks < 8) ||
+         (double_colons == 0 && chunks == 8));
+}
+
+static bool is_fqdn_text(const wchar_t *text) {
+    size_t len = wcslen(text);
+    int label_len = 0;
+    bool saw_dot = false, final_label_has_alpha = false;
+    wchar_t prev = L'\0';
+
+    if (!len || len > 253)
+        return false;
+    if (text[len - 1] == L'.')
+        len--;
+    if (!len)
+        return false;
+
+    for (size_t i = 0; i < len; i++) {
+        wchar_t ch = text[i];
+
+        if (ch == L'.') {
+            if (!label_len || prev == L'-')
+                return false;
+            saw_dot = true;
+            label_len = 0;
+            final_label_has_alpha = false;
+            prev = ch;
+            continue;
+        }
+
+        if (!is_ascii_alnum_w(ch) && ch != L'-')
+            return false;
+        if (!label_len && ch == L'-')
+            return false;
+        if (++label_len > 63)
+            return false;
+        if (is_ascii_alpha_w(ch))
+            final_label_has_alpha = true;
+        prev = ch;
+    }
+
+    return saw_dot && label_len && prev != L'-' && final_label_has_alpha;
+}
+
+static const wchar_t *host_part_from_target(const wchar_t *text) {
+    const wchar_t *at = wcsrchr(text, L'@');
+
+    if (!at)
+        return text;
+    if (at == text || !at[1] || !is_username_text(text, at - text))
+        return NULL;
+    return at + 1;
+}
+
+static bool is_launchable_host_text(const wchar_t *text) {
+    const wchar_t *host = host_part_from_target(text);
+
+    if (!host)
+        return false;
+    return is_ipv4_address_text(host) ||
+        is_ipv6_address_text(host) ||
+        is_fqdn_text(host);
+}
+
+static bool raw_sessions_include_exact_wide(
+    const SessionList *raw, const wchar_t *name) {
+    for (int i = 0; i < raw->count; i++) {
+        wchar_t *wname = dup_mb_to_wc(CP_UTF8, raw->items[i].full_name);
+        bool equal = CompareStringW(LOCALE_USER_DEFAULT, NORM_IGNORECASE,
+                                    wname, -1, name, -1) == CSTR_EQUAL;
+        sfree(wname);
+        if (equal)
             return true;
     }
     return false;
@@ -550,16 +747,47 @@ static bool selected_minimized_session_point(POINT *pt) {
     return true;
 }
 
+static void add_host_search_item(
+    SessionList *view, const SessionList *raw, const wchar_t *filter) {
+    wchar_t *host = dup_trimmed_wcs(filter);
+
+    if (is_launchable_host_text(host) &&
+        !raw_sessions_include_exact_wide(raw, host)) {
+        char *host_utf8 = dup_wc_to_mb(CP_UTF8, host, "");
+        sl_add_host(view, host_utf8);
+        sfree(host_utf8);
+    }
+
+    sfree(host);
+}
+
+static bool get_putty_exe_path(wchar_t *path, size_t pathlen) {
+    static const wchar_t suffix[] = L"\\putty.exe";
+    DWORD got;
+    wchar_t *p;
+
+    got = GetModuleFileNameW(NULL, path, (DWORD)pathlen);
+    if (!got || got >= pathlen)
+        return false;
+
+    p = wcsrchr(path, L'\\');
+    if (p)
+        *p = L'\0';
+
+    if (wcslen(path) + lenof(suffix) > pathlen)
+        return false;
+    wcscat(path, suffix);
+    return true;
+}
+
 static void launch_putty_with_session(const char *session_name, bool edit_mode) {
     wchar_t path[MAX_PATH];
     wchar_t cmd[MAX_PATH * 2];
     STARTUPINFOW si_proc = {sizeof(si_proc)};
     PROCESS_INFORMATION pi = {0};
 
-    GetModuleFileNameW(NULL, path, MAX_PATH);
-    wchar_t *p = wcsrchr(path, L'\\');
-    if (p) *p = 0;
-    wcscat(path, L"\\putty.exe");
+    if (!get_putty_exe_path(path, lenof(path)))
+        return;
 
     if (session_name) {
         wchar_t *ws = dup_mb_to_wc(CP_UTF8, session_name);
@@ -574,6 +802,47 @@ static void launch_putty_with_session(const char *session_name, bool edit_mode) 
     }
 
     if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si_proc, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        ShowWindow(g_hwndMain, SW_HIDE);
+    }
+}
+
+static void launch_putty_with_host(const char *target) {
+    wchar_t path[MAX_PATH];
+    wchar_t cmd[MAX_PATH * 3];
+    wchar_t *wide_target, *host, *user = NULL;
+    STARTUPINFOW si_proc = {sizeof(si_proc)};
+    PROCESS_INFORMATION pi = {0};
+
+    if (!get_putty_exe_path(path, lenof(path)))
+        return;
+
+    wide_target = dup_mb_to_wc(CP_UTF8, target);
+    wchar_t *at = wcsrchr(wide_target, L'@');
+    if (at) {
+        *at = L'\0';
+        user = wide_target;
+        host = at + 1;
+        if (!is_username_text(user, wcslen(user)) ||
+            !is_launchable_host_text(host)) {
+            sfree(wide_target);
+            return;
+        }
+        swprintf(cmd, lenof(cmd), L"\"%ls\" -l \"%ls\" \"%ls\"",
+                 path, user, host);
+    } else {
+        host = wide_target;
+        if (!is_launchable_host_text(host)) {
+            sfree(wide_target);
+            return;
+        }
+        swprintf(cmd, lenof(cmd), L"\"%ls\" \"%ls\"", path, host);
+    }
+    sfree(wide_target);
+
+    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL,
+                       &si_proc, &pi)) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         ShowWindow(g_hwndMain, SW_HIDE);
@@ -638,6 +907,7 @@ static void update_view() {
             }
             sfree(wname);
         }
+        add_host_search_item(&view, &raw, filter);
     } else {
         /* Explorer mode */
         if (g_current_path[0]) sl_add(&view, NULL, ".. [Go Up]", NULL, true);
@@ -680,12 +950,15 @@ static void update_view() {
         wchar_t buf[MAX_PATH + 64];
         wchar_t *wd = dup_mb_to_wc(CP_UTF8, view.items[i].display);
         if (view.items[i].is_dir) swprintf(buf, lenof(buf), L"> %ls", wd);
+        else if (view.items[i].is_host) swprintf(buf, lenof(buf),
+                                                 L"Connect to %ls", wd);
         else if (view.items[i].tag) swprintf(buf, lenof(buf), L"%ls [%ls]", wd, view.items[i].tag);
         else swprintf(buf, lenof(buf), L"%ls", wd);
         
         int idx = (int)SendMessageW(g_hwndList, LB_ADDSTRING, 0, (LPARAM)buf);
         SessionItem *save = snew(SessionItem);
         save->is_dir = view.items[i].is_dir;
+        save->is_host = view.items[i].is_host;
         save->full_name = view.items[i].full_name ? dupstr(view.items[i].full_name) : NULL;
         save->display = dupstr(view.items[i].display);
         SendMessage(g_hwndList, LB_SETITEMDATA, idx, (LPARAM)save);
@@ -792,6 +1065,8 @@ static void handle_selection() {
         }
         SetWindowTextW(g_hwndSearch, L"");
         update_view();
+    } else if (si->is_host) {
+        launch_putty_with_host(si->full_name);
     } else {
         launch_putty_with_session(si->full_name, false);
     }
@@ -799,7 +1074,7 @@ static void handle_selection() {
 
 static void handle_load_button(void) {
     SessionItem *si = get_selected_item();
-    if (!si || si->is_dir)
+    if (!si || si->is_dir || si->is_host)
         return;
 
     launch_putty_with_session(si->full_name, true);
@@ -811,7 +1086,8 @@ static void handle_new_button(void) {
 
 static void update_button_state(void) {
     SessionItem *si = get_selected_item();
-    EnableWindow(g_hwndLoad, (si && !si->is_dir) ? TRUE : FALSE);
+    EnableWindow(g_hwndLoad, (si && !si->is_dir && !si->is_host) ?
+                 TRUE : FALSE);
     EnableWindow(g_hwndNew, TRUE);
 }
 
