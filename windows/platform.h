@@ -47,6 +47,17 @@
  * being a Pageant transaction */
 #define AGENT_COPYDATA_ID 0x804e50ba
 
+/* Launcher IPC for aggregating PuTTY windows hidden on minimise. */
+#define PUTTY_LAUNCHER_WNDCLASS L"PuTTYLauncherWindow"
+#define PUTTY_LAUNCHER_COPYDATA_MINIMIZED_SESSION 0x50a7c084
+#define PUTTY_SYSCOMMAND_MINIMIZE_TO_TRAY 0x01B0
+typedef struct PuttyLauncherMinimizedSessionCopyData {
+    HWND hwnd;
+    DWORD title_chars;
+    DWORD session_name_chars;
+    wchar_t strings[1];              /* title\0session_name\0 */
+} PuttyLauncherMinimizedSessionCopyData;
+
 struct Filename {
     /*
      * A Windows Filename stores a path in three formats:

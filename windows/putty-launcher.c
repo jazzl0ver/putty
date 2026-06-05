@@ -15,8 +15,17 @@
 #define IDC_SESSION_LIST 102
 #define IDC_LOAD_BUTTON  103
 #define IDC_NEW_BUTTON   104
+#define IDC_MIN_SEARCH_EDIT  105
+#define IDC_MIN_SESSION_LIST 106
+#define IDC_MINIMIZE_ALL_TO_TRAY 2001
 #define IDC_TRAY_ABOUT   2002
 #define IDC_TRAY_EXIT    2003
+#define IDC_MIN_RESTORE_ALL           2004
+#define IDC_MIN_CLOSE_ALL             2005
+#define IDC_MIN_CTX_RESTORE           3001
+#define IDC_MIN_CTX_CLOSE             3002
+#define IDC_MIN_CTX_COPY_TITLE        3003
+#define IDC_MIN_CTX_COPY_SESSION_NAME 3004
 
 #define TRAY_UID 1
 #define WM_TRAY  (WM_APP + 1)
@@ -31,9 +40,19 @@ static HWND g_hwndSearch = NULL;
 static HWND g_hwndList = NULL;
 static HWND g_hwndLoad = NULL;
 static HWND g_hwndNew = NULL;
+static HWND g_hwndMinimized = NULL;
+static HWND g_hwndMinSearch = NULL;
+static HWND g_hwndMinList = NULL;
+static HWND g_hwndMinimizeAll = NULL;
+static HWND g_hwndMinRestoreAll = NULL;
+static HWND g_hwndMinCloseAll = NULL;
+static HWND g_hwndMinAbout = NULL;
+static HWND g_hwndMinExit = NULL;
+static WNDPROC g_minListProcOrig = NULL;
 static NOTIFYICONDATAW gnid;
 
-static const wchar_t *g_wndclass  = L"PuTTYLauncherWindow";
+static const wchar_t *g_wndclass  = PUTTY_LAUNCHER_WNDCLASS;
+static const wchar_t *g_min_wndclass = L"PuTTYLauncherMinimizedWindow";
 static const wchar_t *g_mutexname = L"PuTTYLauncherSingleton";
 
 /* --- State --- */
@@ -50,6 +69,16 @@ typedef struct {
     SessionItem *items;
     int count, capacity;
 } SessionList;
+
+typedef struct {
+    HWND hwnd;
+    wchar_t *title;
+    wchar_t *session_name;
+} MinimizedSessionItem;
+
+static MinimizedSessionItem *g_minimized_sessions = NULL;
+static int g_minimized_session_count = 0;
+static int g_minimized_session_capacity = 0;
 
 /* --- Helpers --- */
 
@@ -95,6 +124,12 @@ static int compare_sessions(const void *a, const void *b) {
 }
 
 static void update_button_state(void);
+static void update_minimized_view(void);
+static void reset_and_show_minimized_sessions(HWND hwnd);
+static LRESULT CALLBACK MinimizedWndProc(HWND hwnd, UINT msg,
+                                         WPARAM wParam, LPARAM lParam);
+static LRESULT CALLBACK MinimizedListProc(HWND hwnd, UINT msg,
+                                          WPARAM wParam, LPARAM lParam);
 
 static void show_about_box(HWND hwnd) {
     char *buildinfo_text = buildinfo("\r\n");
@@ -112,6 +147,407 @@ static void show_about_box(HWND hwnd) {
     sfree(wbuildinfo);
     sfree(wver);
     sfree(buildinfo_text);
+}
+
+static void minimized_session_free(MinimizedSessionItem *item) {
+    sfree(item->title);
+    sfree(item->session_name);
+}
+
+static const wchar_t *minimized_session_title(
+    const MinimizedSessionItem *item) {
+    return item->title && item->title[0] ? item->title : L"PuTTY session";
+}
+
+static bool minimized_session_has_name(const MinimizedSessionItem *item) {
+    return item->session_name && item->session_name[0];
+}
+
+static int find_minimized_session(HWND hwnd) {
+    for (int i = 0; i < g_minimized_session_count; i++) {
+        if (g_minimized_sessions[i].hwnd == hwnd)
+            return i;
+    }
+    return -1;
+}
+
+static void remove_minimized_session_at(int index) {
+    if (index < 0 || index >= g_minimized_session_count)
+        return;
+
+    minimized_session_free(&g_minimized_sessions[index]);
+    memmove(g_minimized_sessions + index, g_minimized_sessions + index + 1,
+            (g_minimized_session_count - index - 1) *
+            sizeof(*g_minimized_sessions));
+    g_minimized_session_count--;
+}
+
+static void free_minimized_sessions(void) {
+    for (int i = 0; i < g_minimized_session_count; i++)
+        minimized_session_free(&g_minimized_sessions[i]);
+    sfree(g_minimized_sessions);
+    g_minimized_sessions = NULL;
+    g_minimized_session_count = 0;
+    g_minimized_session_capacity = 0;
+}
+
+static void prune_minimized_sessions(void) {
+    for (int i = 0; i < g_minimized_session_count ;) {
+        if (!IsWindow(g_minimized_sessions[i].hwnd))
+            remove_minimized_session_at(i);
+        else
+            i++;
+    }
+}
+
+static bool wcsistr(const wchar_t *haystack, const wchar_t *needle) {
+    size_t haystack_chars = wcslen(haystack);
+    size_t needle_chars = wcslen(needle);
+
+    if (needle_chars == 0)
+        return true;
+
+    for (size_t i = 0; i + needle_chars <= haystack_chars; i++) {
+        if (CompareStringW(LOCALE_USER_DEFAULT, NORM_IGNORECASE,
+                           haystack + i, (int)needle_chars,
+                           needle, (int)needle_chars) == CSTR_EQUAL)
+            return true;
+    }
+    return false;
+}
+
+static bool minimized_session_matches_filter(
+    const MinimizedSessionItem *item, const wchar_t *filter) {
+    if (!filter || !filter[0])
+        return true;
+    if (wcsistr(minimized_session_title(item), filter))
+        return true;
+    return minimized_session_has_name(item) &&
+        wcsistr(item->session_name, filter);
+}
+
+static void add_or_update_minimized_session(
+    HWND hwnd, const wchar_t *title, const wchar_t *session_name) {
+    int index;
+
+    if (!IsWindow(hwnd))
+        return;
+
+    index = find_minimized_session(hwnd);
+    if (index < 0) {
+        if (g_minimized_session_count == g_minimized_session_capacity) {
+            g_minimized_session_capacity = g_minimized_session_capacity ?
+                g_minimized_session_capacity * 2 : 32;
+            g_minimized_sessions = sresize(
+                g_minimized_sessions, g_minimized_session_capacity,
+                MinimizedSessionItem);
+        }
+        index = g_minimized_session_count++;
+        memset(&g_minimized_sessions[index], 0,
+               sizeof(g_minimized_sessions[index]));
+        g_minimized_sessions[index].hwnd = hwnd;
+    } else {
+        minimized_session_free(&g_minimized_sessions[index]);
+    }
+
+    g_minimized_sessions[index].title = dupwcs(title ? title : L"");
+    g_minimized_sessions[index].session_name =
+        dupwcs(session_name ? session_name : L"");
+
+    if (g_hwndMinimized && IsWindowVisible(g_hwndMinimized))
+        update_minimized_view();
+}
+
+static bool handle_minimized_copydata(const COPYDATASTRUCT *cds) {
+    const PuttyLauncherMinimizedSessionCopyData *payload;
+    const wchar_t *title, *session_name;
+    size_t header_bytes, payload_chars, needed_bytes;
+
+    if (!cds || cds->dwData != PUTTY_LAUNCHER_COPYDATA_MINIMIZED_SESSION ||
+        !cds->lpData)
+        return false;
+
+    header_bytes = offsetof(PuttyLauncherMinimizedSessionCopyData, strings);
+    if (cds->cbData < header_bytes)
+        return false;
+
+    payload = (const PuttyLauncherMinimizedSessionCopyData *)cds->lpData;
+    if ((size_t)payload->title_chars > (size_t)-1 - 2 ||
+        (size_t)payload->session_name_chars >
+        (size_t)-1 - (size_t)payload->title_chars - 2)
+        return false;
+
+    payload_chars =
+        (size_t)payload->title_chars + 1 + payload->session_name_chars + 1;
+    if (payload_chars > ((size_t)-1 - header_bytes) / sizeof(wchar_t))
+        return false;
+
+    needed_bytes = header_bytes + payload_chars * sizeof(wchar_t);
+
+    if (needed_bytes > cds->cbData)
+        return false;
+
+    title = payload->strings;
+    session_name = title + payload->title_chars + 1;
+    if (title[payload->title_chars] != L'\0' ||
+        session_name[payload->session_name_chars] != L'\0')
+        return false;
+
+    add_or_update_minimized_session(payload->hwnd, title, session_name);
+    return true;
+}
+
+static void copy_text_to_clipboard(HWND owner, const wchar_t *text) {
+    size_t bytes;
+    HGLOBAL data;
+    wchar_t *target;
+
+    if (!text)
+        return;
+
+    bytes = (wcslen(text) + 1) * sizeof(wchar_t);
+    data = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!data)
+        return;
+
+    target = (wchar_t *)GlobalLock(data);
+    if (!target) {
+        GlobalFree(data);
+        return;
+    }
+
+    memcpy(target, text, bytes);
+    GlobalUnlock(data);
+
+    if (OpenClipboard(owner)) {
+        EmptyClipboard();
+        if (!SetClipboardData(CF_UNICODETEXT, data))
+            GlobalFree(data);
+        CloseClipboard();
+    } else {
+        GlobalFree(data);
+    }
+}
+
+static HWND get_selected_minimized_hwnd(void) {
+    int sel;
+    LRESULT data;
+
+    if (!g_hwndMinList)
+        return NULL;
+
+    sel = (int)SendMessage(g_hwndMinList, LB_GETCURSEL, 0, 0);
+    if (sel == LB_ERR)
+        return NULL;
+
+    data = SendMessage(g_hwndMinList, LB_GETITEMDATA, sel, 0);
+    return data == LB_ERR ? NULL : (HWND)data;
+}
+
+static void restore_minimized_session(HWND session_hwnd) {
+    int index;
+
+    prune_minimized_sessions();
+    index = find_minimized_session(session_hwnd);
+    if (index < 0) {
+        update_minimized_view();
+        return;
+    }
+
+    ShowWindow(g_minimized_sessions[index].hwnd, SW_RESTORE);
+    SetForegroundWindow(g_minimized_sessions[index].hwnd);
+    remove_minimized_session_at(index);
+    update_minimized_view();
+    if (g_hwndMinimized)
+        ShowWindow(g_hwndMinimized, SW_HIDE);
+}
+
+static void restore_selected_minimized_session(void) {
+    HWND session_hwnd = get_selected_minimized_hwnd();
+    if (session_hwnd)
+        restore_minimized_session(session_hwnd);
+}
+
+static void restore_all_minimized_sessions(void) {
+    HWND restored_hwnd = NULL;
+
+    prune_minimized_sessions();
+    while (g_minimized_session_count > 0) {
+        HWND hwnd = g_minimized_sessions[0].hwnd;
+        ShowWindow(hwnd, SW_RESTORE);
+        restored_hwnd = hwnd;
+        remove_minimized_session_at(0);
+    }
+
+    if (restored_hwnd)
+        SetForegroundWindow(restored_hwnd);
+    update_minimized_view();
+    if (g_hwndMinimized)
+        ShowWindow(g_hwndMinimized, SW_HIDE);
+}
+
+static void close_minimized_session(HWND session_hwnd) {
+    int index;
+
+    prune_minimized_sessions();
+    index = find_minimized_session(session_hwnd);
+    if (index >= 0)
+        PostMessage(g_minimized_sessions[index].hwnd, WM_CLOSE, 0, 0);
+    update_minimized_view();
+}
+
+static void close_all_minimized_sessions(void) {
+    int result;
+
+    prune_minimized_sessions();
+    if (g_minimized_session_count == 0) {
+        update_minimized_view();
+        return;
+    }
+
+    result = MessageBoxW(
+        g_hwndMinimized,
+        L"Close all minimized PuTTY sessions?",
+        L"PuTTY Launcher",
+        MB_ICONWARNING | MB_OKCANCEL | MB_DEFBUTTON2);
+    if (result != IDOK)
+        return;
+
+    for (int i = 0; i < g_minimized_session_count; i++)
+        PostMessage(g_minimized_sessions[i].hwnd, WM_CLOSE, 0, 0);
+    update_minimized_view();
+}
+
+typedef struct {
+    int posted;
+} MinimizeAllToTrayContext;
+
+static bool is_putty_terminal_window(HWND hwnd) {
+    wchar_t classname[64];
+
+    if (!GetClassNameW(hwnd, classname, lenof(classname)))
+        return false;
+
+    return !wcscmp(classname, L"PuTTY") ||
+        !wcscmp(classname, L"PuTTY.ansi");
+}
+
+static BOOL CALLBACK minimize_all_to_tray_proc(HWND hwnd, LPARAM lParam) {
+    MinimizeAllToTrayContext *ctx = (MinimizeAllToTrayContext *)lParam;
+
+    if (!IsWindowVisible(hwnd) || !is_putty_terminal_window(hwnd))
+        return TRUE;
+    if (find_minimized_session(hwnd) >= 0)
+        return TRUE;
+
+    if (PostMessage(hwnd, WM_SYSCOMMAND,
+                    PUTTY_SYSCOMMAND_MINIMIZE_TO_TRAY, 0))
+        ctx->posted++;
+    return TRUE;
+}
+
+static void minimize_all_putty_windows_to_tray(void) {
+    MinimizeAllToTrayContext ctx;
+
+    memset(&ctx, 0, sizeof(ctx));
+    prune_minimized_sessions();
+    EnumWindows(minimize_all_to_tray_proc, (LPARAM)&ctx);
+
+    if (!ctx.posted)
+        update_minimized_view();
+}
+
+static void show_minimized_context_menu(HWND list, POINT pt) {
+    HWND session_hwnd = get_selected_minimized_hwnd();
+    int index;
+    HMENU menu;
+    UINT cmd;
+
+    (void)list;
+
+    prune_minimized_sessions();
+    index = find_minimized_session(session_hwnd);
+    if (index < 0) {
+        update_minimized_view();
+        return;
+    }
+
+    menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, IDC_MIN_CTX_RESTORE, L"Restore");
+    AppendMenuW(menu, MF_STRING, IDC_MIN_CTX_CLOSE, L"Close session");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, IDC_MIN_CTX_COPY_TITLE, L"Copy title");
+    if (minimized_session_has_name(&g_minimized_sessions[index])) {
+        AppendMenuW(menu, MF_STRING, IDC_MIN_CTX_COPY_SESSION_NAME,
+                    L"Copy session name");
+    }
+
+    SetForegroundWindow(g_hwndMinimized);
+    cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                         pt.x, pt.y, 0, g_hwndMinimized, NULL);
+    DestroyMenu(menu);
+
+    switch (cmd) {
+      case IDC_MIN_CTX_RESTORE:
+        restore_minimized_session(session_hwnd);
+        break;
+      case IDC_MIN_CTX_CLOSE:
+        close_minimized_session(session_hwnd);
+        break;
+      case IDC_MIN_CTX_COPY_TITLE:
+        index = find_minimized_session(session_hwnd);
+        if (index >= 0)
+            copy_text_to_clipboard(
+                g_hwndMinimized,
+                minimized_session_title(&g_minimized_sessions[index]));
+        break;
+      case IDC_MIN_CTX_COPY_SESSION_NAME:
+        index = find_minimized_session(session_hwnd);
+        if (index >= 0 && minimized_session_has_name(
+                &g_minimized_sessions[index]))
+            copy_text_to_clipboard(
+                g_hwndMinimized, g_minimized_sessions[index].session_name);
+        break;
+    }
+}
+
+static bool select_minimized_session_at_point(LPARAM lParam) {
+    POINT pt;
+    LRESULT hit;
+    int index, count;
+
+    if (!g_hwndMinList)
+        return false;
+
+    pt.x = (int)(short)LOWORD(lParam);
+    pt.y = (int)(short)HIWORD(lParam);
+    hit = SendMessage(g_hwndMinList, LB_ITEMFROMPOINT, 0,
+                      MAKELPARAM(pt.x, pt.y));
+    index = LOWORD(hit);
+    count = (int)SendMessage(g_hwndMinList, LB_GETCOUNT, 0, 0);
+    if (HIWORD(hit) || index < 0 || index >= count)
+        return false;
+
+    if (!SendMessage(g_hwndMinList, LB_GETITEMDATA, index, 0))
+        return false;
+
+    SendMessage(g_hwndMinList, LB_SETCURSEL, index, 0);
+    return true;
+}
+
+static bool selected_minimized_session_point(POINT *pt) {
+    int sel;
+    RECT rect;
+
+    sel = (int)SendMessage(g_hwndMinList, LB_GETCURSEL, 0, 0);
+    if (sel == LB_ERR ||
+        SendMessage(g_hwndMinList, LB_GETITEMRECT, sel, (LPARAM)&rect) == LB_ERR)
+        return false;
+
+    pt->x = rect.left;
+    pt->y = rect.bottom;
+    ClientToScreen(g_hwndMinList, pt);
+    return true;
 }
 
 static void launch_putty_with_session(const char *session_name, bool edit_mode) {
@@ -265,6 +701,65 @@ static void update_view() {
     update_button_state();
 }
 
+static void update_minimized_view(void) {
+    wchar_t filter[MAX_PATH] = {0};
+    int added = 0;
+
+    if (!g_hwndMinList)
+        return;
+
+    if (g_hwndMinSearch)
+        GetWindowTextW(g_hwndMinSearch, filter, MAX_PATH);
+
+    prune_minimized_sessions();
+    SendMessage(g_hwndMinList, LB_RESETCONTENT, 0, 0);
+
+    for (int i = 0; i < g_minimized_session_count; i++) {
+        MinimizedSessionItem *item = &g_minimized_sessions[i];
+        wchar_t *display;
+        int idx;
+
+        if (!minimized_session_matches_filter(item, filter))
+            continue;
+
+        if (minimized_session_has_name(item)) {
+            display = dupwcscat(minimized_session_title(item), L" [",
+                                item->session_name, L"]");
+        } else {
+            display = dupwcs(minimized_session_title(item));
+        }
+
+        idx = (int)SendMessageW(g_hwndMinList, LB_ADDSTRING, 0,
+                                (LPARAM)display);
+        if (idx != LB_ERR) {
+            SendMessage(g_hwndMinList, LB_SETITEMDATA, idx,
+                        (LPARAM)item->hwnd);
+            added++;
+        }
+        sfree(display);
+    }
+
+    if (added > 0) {
+        SendMessage(g_hwndMinList, LB_SETCURSEL, 0, 0);
+    } else {
+        const wchar_t *message = g_minimized_session_count ?
+            L"No matching minimized PuTTY sessions" :
+            L"No minimized PuTTY sessions";
+        int idx = (int)SendMessageW(g_hwndMinList, LB_ADDSTRING, 0,
+                                    (LPARAM)message);
+        if (idx != LB_ERR)
+            SendMessage(g_hwndMinList, LB_SETITEMDATA, idx, 0);
+        SendMessage(g_hwndMinList, LB_SETCURSEL, (WPARAM)-1, 0);
+    }
+
+    if (g_hwndMinRestoreAll)
+        EnableWindow(g_hwndMinRestoreAll,
+                     g_minimized_session_count > 0 ? TRUE : FALSE);
+    if (g_hwndMinCloseAll)
+        EnableWindow(g_hwndMinCloseAll,
+                     g_minimized_session_count > 0 ? TRUE : FALSE);
+}
+
 static SessionItem *get_selected_item(void) {
     int sel = (int)SendMessage(g_hwndList, LB_GETCURSEL, 0, 0);
     
@@ -325,6 +820,9 @@ static void handle_list_selection_change(void) {
 }
 
 static void reset_and_show_launcher(HWND hwnd) {
+    if (g_hwndMinimized)
+        ShowWindow(g_hwndMinimized, SW_HIDE);
+
     g_current_path[0] = '\0';
     SetWindowTextW(g_hwndSearch, L"");
     update_view();
@@ -335,6 +833,25 @@ static void reset_and_show_launcher(HWND hwnd) {
     SetWindowPos(hwnd, HWND_TOPMOST, pt.x - 175, pt.y - 510, 350, 500, SWP_SHOWWINDOW);
     SetForegroundWindow(hwnd);
     SetFocus(g_hwndSearch);
+}
+
+static void reset_and_show_minimized_sessions(HWND hwnd) {
+    POINT pt;
+
+    (void)hwnd;
+
+    if (!g_hwndMinimized)
+        return;
+
+    ShowWindow(g_hwndMain, SW_HIDE);
+    SetWindowTextW(g_hwndMinSearch, L"");
+    update_minimized_view();
+
+    GetCursorPos(&pt);
+    SetWindowPos(g_hwndMinimized, HWND_TOPMOST, pt.x - 210, pt.y - 510,
+                 420, 500, SWP_SHOWWINDOW);
+    SetForegroundWindow(g_hwndMinimized);
+    SetFocus(g_hwndMinSearch);
 }
 
 static void navigate_up(void) {
@@ -375,24 +892,183 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (LOWORD(wParam) == IDC_SESSION_LIST && HIWORD(wParam) == LBN_SELCHANGE) handle_list_selection_change();
             if (LOWORD(wParam) == IDC_LOAD_BUTTON && HIWORD(wParam) == BN_CLICKED) handle_load_button();
             if (LOWORD(wParam) == IDC_NEW_BUTTON && HIWORD(wParam) == BN_CLICKED) handle_new_button();
-            if (LOWORD(wParam) == IDC_TRAY_ABOUT) show_about_box(hwnd);
-            if (LOWORD(wParam) == IDC_TRAY_EXIT) DestroyWindow(hwnd);
             return 0;
+        case WM_COPYDATA:
+            return handle_minimized_copydata((COPYDATASTRUCT *)lParam) ? 1 : 0;
         case WM_TRAY:
             if (lParam == WM_RBUTTONUP) {
-                HMENU m = CreatePopupMenu();
-                AppendMenuW(m, MF_STRING, IDC_TRAY_ABOUT, L"About PuTTY Launcher");
-                AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-                AppendMenuW(m, MF_STRING, IDC_TRAY_EXIT, L"Exit Launcher");
-                POINT pt; GetCursorPos(&pt); SetForegroundWindow(hwnd);
-                TrackPopupMenu(m, TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, NULL);
-                DestroyMenu(m);
+                reset_and_show_minimized_sessions(hwnd);
             } else if (lParam == WM_LBUTTONUP) {
                 reset_and_show_launcher(hwnd);
             }
             return 0;
         case WM_DESTROY:
-            clear_list_data(); Shell_NotifyIconW(NIM_DELETE, &gnid); PostQuitMessage(0);
+            clear_list_data();
+            free_minimized_sessions();
+            Shell_NotifyIconW(NIM_DELETE, &gnid);
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static LRESULT call_minimized_list_proc(HWND hwnd, UINT msg, WPARAM wParam,
+                                        LPARAM lParam) {
+    if (g_minListProcOrig)
+        return CallWindowProcW(g_minListProcOrig, hwnd, msg, wParam, lParam);
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK MinimizedListProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                          LPARAM lParam) {
+    switch (msg) {
+        case WM_LBUTTONUP: {
+            LRESULT result = call_minimized_list_proc(
+                hwnd, msg, wParam, lParam);
+            restore_selected_minimized_session();
+            return result;
+        }
+        case WM_RBUTTONDOWN:
+            if (select_minimized_session_at_point(lParam)) {
+                SetFocus(hwnd);
+                return 0;
+            }
+            break;
+        case WM_RBUTTONUP:
+            if (select_minimized_session_at_point(lParam)) {
+                POINT pt;
+                pt.x = (int)(short)LOWORD(lParam);
+                pt.y = (int)(short)HIWORD(lParam);
+                ClientToScreen(hwnd, &pt);
+                show_minimized_context_menu(hwnd, pt);
+                return 0;
+            }
+            break;
+        case WM_CONTEXTMENU: {
+            POINT pt;
+            if (lParam == (LPARAM)-1) {
+                if (!selected_minimized_session_point(&pt))
+                    return 0;
+            } else {
+                POINT client;
+                pt.x = (int)(short)LOWORD(lParam);
+                pt.y = (int)(short)HIWORD(lParam);
+                client = pt;
+                ScreenToClient(hwnd, &client);
+                if (!select_minimized_session_at_point(
+                        MAKELPARAM(client.x, client.y)))
+                    return 0;
+            }
+            show_minimized_context_menu(hwnd, pt);
+            return 0;
+        }
+    }
+    return call_minimized_list_proc(hwnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK MinimizedWndProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                         LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE:
+            g_hwndMinSearch = CreateWindowExW(
+                0, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                5, 5, 410, 25, hwnd, (HMENU)IDC_MIN_SEARCH_EDIT, ghInst,
+                NULL);
+            g_hwndMinList = CreateWindowExW(
+                0, L"LISTBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL |
+                WS_TABSTOP | LBS_NOTIFY | LBS_HASSTRINGS,
+                5, 35, 410, 335, hwnd, (HMENU)IDC_MIN_SESSION_LIST, ghInst,
+                NULL);
+            g_hwndMinimizeAll = CreateWindowExW(
+                0, L"BUTTON", L"Minimize all to tray",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                5, 375, 410, 35, hwnd, (HMENU)IDC_MINIMIZE_ALL_TO_TRAY, ghInst,
+                NULL);
+            g_hwndMinRestoreAll = CreateWindowExW(
+                0, L"BUTTON", L"Restore all",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                5, 415, 200, 35, hwnd, (HMENU)IDC_MIN_RESTORE_ALL, ghInst,
+                NULL);
+            g_hwndMinCloseAll = CreateWindowExW(
+                0, L"BUTTON", L"Close all...",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                215, 415, 200, 35, hwnd, (HMENU)IDC_MIN_CLOSE_ALL, ghInst,
+                NULL);
+            g_hwndMinAbout = CreateWindowExW(
+                0, L"BUTTON", L"About",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                5, 455, 200, 35, hwnd, (HMENU)IDC_TRAY_ABOUT, ghInst, NULL);
+            g_hwndMinExit = CreateWindowExW(
+                0, L"BUTTON", L"Exit",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                215, 455, 200, 35, hwnd, (HMENU)IDC_TRAY_EXIT, ghInst, NULL);
+            SendMessage(g_hwndMinSearch, WM_SETFONT,
+                        (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            SendMessage(g_hwndMinList, WM_SETFONT,
+                        (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            SendMessage(g_hwndMinimizeAll, WM_SETFONT,
+                        (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            SendMessage(g_hwndMinRestoreAll, WM_SETFONT,
+                        (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            SendMessage(g_hwndMinCloseAll, WM_SETFONT,
+                        (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            SendMessage(g_hwndMinAbout, WM_SETFONT,
+                        (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            SendMessage(g_hwndMinExit, WM_SETFONT,
+                        (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            g_minListProcOrig = (WNDPROC)SetWindowLongPtr(
+                g_hwndMinList, GWLP_WNDPROC, (LONG_PTR)MinimizedListProc);
+            update_minimized_view();
+            return 0;
+        case WM_SIZE:
+            if (g_hwndMinSearch && g_hwndMinList &&
+                g_hwndMinimizeAll && g_hwndMinRestoreAll &&
+                g_hwndMinCloseAll && g_hwndMinAbout && g_hwndMinExit) {
+                int width = LOWORD(lParam);
+                int height = HIWORD(lParam);
+                int button_width = (width - 15) / 2;
+                MoveWindow(g_hwndMinSearch, 5, 5, width - 10, 25, TRUE);
+                MoveWindow(g_hwndMinList, 5, 35, width - 10, height - 165,
+                           TRUE);
+                MoveWindow(g_hwndMinimizeAll, 5, height - 120, width - 10, 35,
+                           TRUE);
+                MoveWindow(g_hwndMinRestoreAll, 5, height - 80, button_width,
+                           35, TRUE);
+                MoveWindow(g_hwndMinCloseAll, 10 + button_width, height - 80,
+                           width - 15 - button_width, 35,
+                           TRUE);
+                MoveWindow(g_hwndMinAbout, 5, height - 40, button_width, 35,
+                           TRUE);
+                MoveWindow(g_hwndMinExit, 10 + button_width, height - 40,
+                           width - 15 - button_width, 35, TRUE);
+            }
+            return 0;
+        case WM_ACTIVATE:
+            if (LOWORD(wParam) == WA_INACTIVE)
+                ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDC_MIN_SEARCH_EDIT &&
+                HIWORD(wParam) == EN_CHANGE)
+                update_minimized_view();
+            if (LOWORD(wParam) == IDC_MIN_SESSION_LIST &&
+                HIWORD(wParam) == LBN_DBLCLK)
+                restore_selected_minimized_session();
+            if (LOWORD(wParam) == IDC_MINIMIZE_ALL_TO_TRAY)
+                minimize_all_putty_windows_to_tray();
+            if (LOWORD(wParam) == IDC_MIN_RESTORE_ALL)
+                restore_all_minimized_sessions();
+            if (LOWORD(wParam) == IDC_MIN_CLOSE_ALL)
+                close_all_minimized_sessions();
+            if (LOWORD(wParam) == IDC_TRAY_ABOUT)
+                show_about_box(hwnd);
+            if (LOWORD(wParam) == IDC_TRAY_EXIT)
+                DestroyWindow(g_hwndMain);
+            return 0;
+        case WM_CLOSE:
+            ShowWindow(hwnd, SW_HIDE);
             return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -407,7 +1083,18 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmd, int nShow) {
     wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = g_wndclass; RegisterClassW(&wc);
 
+    WNDCLASSW minwc = {0}; minwc.lpfnWndProc = MinimizedWndProc;
+    minwc.hInstance = hInst;
+    minwc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    minwc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    minwc.lpszClassName = g_min_wndclass; RegisterClassW(&minwc);
+
     g_hwndMain = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, g_wndclass, L"PuTTY Launcher", WS_POPUP | WS_BORDER, 0, 0, 350, 500, NULL, NULL, hInst, NULL);
+    g_hwndMinimized = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                                      g_min_wndclass,
+                                      L"Minimized PuTTY Sessions",
+                                      WS_POPUP | WS_BORDER, 0, 0, 420, 500,
+                                      NULL, NULL, hInst, NULL);
     
     memset(&gnid, 0, sizeof(gnid)); gnid.cbSize = sizeof(gnid); gnid.hWnd = g_hwndMain; gnid.uID = TRAY_UID;
     gnid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; gnid.uCallbackMessage = WM_TRAY;
@@ -446,8 +1133,45 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmd, int nShow) {
                     navigate_up();
                     continue;
                 }
+            } else if (msg.hwnd == g_hwndMinSearch) {
+                if (msg.wParam == VK_DOWN) {
+                    int count = (int)SendMessage(g_hwndMinList, LB_GETCOUNT, 0, 0);
+                    if (count > 0) {
+                        SetFocus(g_hwndMinList);
+                        SendMessage(g_hwndMinList, LB_SETCURSEL, 0, 0);
+                    }
+                    continue;
+                }
+                if (msg.wParam == VK_UP) {
+                    int count = (int)SendMessage(g_hwndMinList, LB_GETCOUNT, 0, 0);
+                    if (count > 0) {
+                        SetFocus(g_hwndMinList);
+                        SendMessage(g_hwndMinList, LB_SETCURSEL, count - 1, 0);
+                    }
+                    continue;
+                }
+                if (msg.wParam == VK_RETURN) {
+                    restore_selected_minimized_session();
+                    continue;
+                }
+            } else if (msg.hwnd == g_hwndMinList) {
+                if (msg.wParam == VK_RETURN) {
+                    restore_selected_minimized_session();
+                    continue;
+                }
+                if (msg.wParam == VK_UP &&
+                    SendMessage(g_hwndMinList, LB_GETCURSEL, 0, 0) == 0) {
+                    SetFocus(g_hwndMinSearch);
+                    continue;
+                }
             }
-            if (msg.wParam == VK_ESCAPE) { ShowWindow(g_hwndMain, SW_HIDE); continue; }
+            if (msg.wParam == VK_ESCAPE) {
+                if (g_hwndMinimized && IsWindowVisible(g_hwndMinimized))
+                    ShowWindow(g_hwndMinimized, SW_HIDE);
+                else
+                    ShowWindow(g_hwndMain, SW_HIDE);
+                continue;
+            }
         }
         TranslateMessage(&msg); DispatchMessageW(&msg);
     }

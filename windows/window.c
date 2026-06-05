@@ -51,6 +51,7 @@
 #define IDM_FULLSCREEN  0x0180
 #define IDM_COPY      0x0190
 #define IDM_PASTE     0x01A0
+#define IDM_MINIMIZE_TO_TRAY PUTTY_SYSCOMMAND_MINIMIZE_TO_TRAY
 #define IDM_SPECIALSEP 0x0200
 
 #define IDM_SPECIAL_MIN 0x0400
@@ -120,6 +121,8 @@ static void setup_clipboards(Terminal *, Conf *);
 /* Window layout information */
 static void reset_window(WinGuiSeat *wgs, int reinit);
 static void save_window_pos_from_hwnd(WinGuiSeat *wgs);
+static bool send_minimize_to_launcher(WinGuiSeat *wgs, HWND hwnd);
+static bool minimize_to_launcher(WinGuiSeat *wgs, HWND hwnd);
 
 static void flash_window(WinGuiSeat *wgs, int mode);
 static void sys_cursor_update(WinGuiSeat *wgs);
@@ -765,8 +768,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
         wgs->popup_menus[SYSMENU].menu = GetSystemMenu(wgs->term_hwnd, false);
         wgs->popup_menus[CTXMENU].menu = CreatePopupMenu();
 
+        InsertMenu(wgs->popup_menus[SYSMENU].menu, SC_MAXIMIZE,
+                   MF_BYCOMMAND | MF_ENABLED, IDM_MINIMIZE_TO_TRAY,
+                   "Minimize to &Tray");
+
         for (j = 0; j < lenof(wgs->popup_menus); j++) {
             m = wgs->popup_menus[j].menu;
+            if (j == CTXMENU) {
+                AppendMenu(m, MF_ENABLED, IDM_MINIMIZE_TO_TRAY,
+                           "Minimize to &Tray");
+                AppendMenu(m, MF_SEPARATOR, 0, 0);
+            }
             AppendMenu(m, MF_ENABLED, IDM_COPY, "&Copy");
             AppendMenu(m, MF_ENABLED, IDM_PASTE, "&Paste");
         }
@@ -2258,6 +2270,87 @@ static void save_window_pos_from_hwnd(WinGuiSeat *wgs)
         conf_get_int(wgs->conf, CONF_height));
 }
 
+static bool send_minimize_to_launcher(WinGuiSeat *wgs, HWND hwnd)
+{
+    HWND launcher;
+    const wchar_t *title, *wide_session_name;
+    wchar_t *allocated_session_name = NULL;
+    char *session_name;
+    size_t header_bytes, title_chars, session_name_chars;
+    size_t payload_chars, payload_bytes;
+    PuttyLauncherMinimizedSessionCopyData *payload;
+    COPYDATASTRUCT cds;
+    DWORD_PTR reply = 0;
+    BOOL sent;
+
+    if (!wgs)
+        return false;
+
+    launcher = FindWindowW(PUTTY_LAUNCHER_WNDCLASS, NULL);
+    if (!launcher)
+        return false;
+
+    title = wgs->window_name ? wgs->window_name : L"PuTTY";
+    session_name = conf_get_str(wgs->conf, CONF_session_name);
+    if (session_name && *session_name)
+        allocated_session_name = dup_mb_to_wc(CP_UTF8, session_name);
+    wide_session_name = allocated_session_name ? allocated_session_name : L"";
+
+    title_chars = wcslen(title);
+    session_name_chars = wcslen(wide_session_name);
+    header_bytes = offsetof(PuttyLauncherMinimizedSessionCopyData, strings);
+    if (title_chars > (size_t)-1 - 2 ||
+        session_name_chars > (size_t)-1 - title_chars - 2) {
+        sfree(allocated_session_name);
+        return false;
+    }
+    payload_chars = title_chars + 1 + session_name_chars + 1;
+    if (payload_chars > ((size_t)-1 - header_bytes) / sizeof(wchar_t)) {
+        sfree(allocated_session_name);
+        return false;
+    }
+    payload_bytes = header_bytes + payload_chars * sizeof(wchar_t);
+
+    if (title_chars > MAXDWORD || session_name_chars > MAXDWORD ||
+        payload_bytes > MAXDWORD) {
+        sfree(allocated_session_name);
+        return false;
+    }
+
+    payload = (PuttyLauncherMinimizedSessionCopyData *)
+        snewn(payload_bytes, unsigned char);
+    payload->hwnd = hwnd;
+    payload->title_chars = (DWORD)title_chars;
+    payload->session_name_chars = (DWORD)session_name_chars;
+    wcscpy(payload->strings, title);
+    wcscpy(payload->strings + title_chars + 1, wide_session_name);
+
+    cds.dwData = PUTTY_LAUNCHER_COPYDATA_MINIMIZED_SESSION;
+    cds.cbData = (DWORD)payload_bytes;
+    cds.lpData = payload;
+
+    sent = SendMessageTimeoutW(launcher, WM_COPYDATA, (WPARAM)hwnd,
+                               (LPARAM)&cds, SMTO_ABORTIFHUNG, 1000, &reply);
+
+    sfree(payload);
+    sfree(allocated_session_name);
+    return sent && reply;
+}
+
+static bool minimize_to_launcher(WinGuiSeat *wgs, HWND hwnd)
+{
+    if (!send_minimize_to_launcher(wgs, hwnd))
+        return false;
+
+    wgs->hidden_to_launcher = true;
+    term_notify_minimised(wgs->term, true);
+    sw_SetWindowText(hwnd,
+                     conf_get_bool(wgs->conf, CONF_win_name_always) ?
+                     wgs->window_name : wgs->icon_name);
+    ShowWindow(hwnd, SW_HIDE);
+    return true;
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                                 WPARAM wParam, LPARAM lParam)
 {
@@ -2267,6 +2360,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
 
     switch (message) {
       case WM_CREATE:
+        break;
+      case WM_SHOWWINDOW:
+        if (wParam && wgs && wgs->hidden_to_launcher) {
+            wgs->hidden_to_launcher = false;
+            term_notify_minimised(wgs->term, false);
+            sw_SetWindowText(hwnd, wgs->window_name);
+        }
         break;
       case WM_CLOSE: {
         char *title, *msg, *additional = NULL;
@@ -2604,6 +2704,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             conf_free(prev_conf);
             break;
           }
+          case IDM_MINIMIZE_TO_TRAY:
+            if (!minimize_to_launcher(wgs, hwnd))
+                ShowWindow(hwnd, SW_MINIMIZE);
+            break;
           case IDM_COPYALL:
             term_copyall(wgs->term, clips_system, lenof(clips_system));
             break;

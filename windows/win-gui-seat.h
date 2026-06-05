@@ -123,6 +123,7 @@ struct WinGuiSeat {
     BusyStatus busy_status;
 
     wchar_t *window_name, *icon_name;
+    bool hidden_to_launcher;
 
     int alt_numberpad_accumulator;
     int compose_state;
