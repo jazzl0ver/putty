@@ -105,6 +105,7 @@ static void init_fonts(WinGuiSeat *wgs, int, int);
 static void init_dpi_info(WinGuiSeat *wgs);
 static void another_font(WinGuiSeat *wgs, int);
 static void deinit_fonts(WinGuiSeat *wgs);
+static void change_font_size(WinGuiSeat *wgs, int increment);
 static void set_input_locale(WinGuiSeat *wgs, HKL);
 static void update_savedsess_menu(WinGuiSeat *wgs);
 static void init_winfuncs(void);
@@ -1714,6 +1715,27 @@ static void deinit_fonts(WinGuiSeat *wgs)
         DestroyIcon(trust_icon);
     }
     trust_icon = INVALID_HANDLE_VALUE;
+}
+
+static void change_font_size(WinGuiSeat *wgs, int increment)
+{
+    FontSpec *font = conf_get_fontspec(wgs->conf, CONF_font);
+    int newheight = font->height + increment;
+
+    if (newheight < 1)
+        return;
+
+    if (newheight != font->height) {
+        FontSpec *newfont = fontspec_new(
+            font->name, font->isbold, newheight, font->charset);
+        conf_set_fontspec(wgs->conf, CONF_font, newfont);
+        fontspec_free(newfont);
+    }
+
+    term_size(wgs->term, conf_get_int(wgs->conf, CONF_height),
+              conf_get_int(wgs->conf, CONF_width),
+              conf_get_int(wgs->conf, CONF_savelines));
+    reset_window(wgs, 2);
 }
 
 static void wintw_request_resize(TermWin *tw, int w, int h)
@@ -3507,6 +3529,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                                    TO_CHR_Y(p.y), shift_pressed,
                                    control_pressed, is_alt_pressed());
                     } /* else: not sure when this can fail */
+                } else if (message != WM_MOUSEHWHEEL && control_pressed) {
+                    change_font_size(wgs, b == MBT_WHEEL_UP ? +1 : -1);
                 } else if (message != WM_MOUSEHWHEEL) {
                     /* trigger a scroll */
                     term_scroll(wgs->term, 0,
