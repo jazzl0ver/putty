@@ -30,6 +30,7 @@
 #include <commctrl.h>
 #include <richedit.h>
 #include <mmsystem.h>
+#include <shellapi.h>
 
 /* From MSDN: In the WM_SYSCOMMAND message, the four low-order bits of
  * wParam are used by Windows, and should be masked off, so we shouldn't
@@ -170,6 +171,7 @@ static void wintw_clip_write(
     TermWin *, int clipboard, wchar_t *text, int *attrs,
     truecolour *colours, int len, bool must_deselect);
 static void wintw_clip_request_paste(TermWin *, int clipboard);
+static bool wintw_open_url(TermWin *, const char *url);
 static void wintw_refresh(TermWin *);
 static void wintw_request_resize(TermWin *, int w, int h);
 static void wintw_set_title(TermWin *, const char *title, int codepage);
@@ -197,6 +199,7 @@ static const TermWinVtable windows_termwin_vt = {
     .bell = wintw_bell,
     .clip_write = wintw_clip_write,
     .clip_request_paste = wintw_clip_request_paste,
+    .open_url = wintw_open_url,
     .refresh = wintw_refresh,
     .request_resize = wintw_request_resize,
     .set_title = wintw_set_title,
@@ -2884,8 +2887,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             }
 
             if (press) {
-                click(wgs, button,
-                      TO_CHR_X(X_POS(lParam)), TO_CHR_Y(Y_POS(lParam)),
+                int x = TO_CHR_X(X_POS(lParam));
+                int y = TO_CHR_Y(Y_POS(lParam));
+
+                if (button == MBT_LEFT && (wParam & MK_CONTROL) &&
+                    (wParam & MK_SHIFT) && term_open_url_at(wgs->term, x, y)) {
+                    wgs->lastbtn = MBT_NOTHING;
+                    return 0;
+                }
+
+                click(wgs, button, x, y,
                       wParam & MK_SHIFT, wParam & MK_CONTROL,
                       is_alt_pressed());
                 SetCapture(hwnd);
@@ -5651,6 +5662,14 @@ static void process_clipdata(WinGuiSeat *wgs, HGLOBAL clipdata, bool unicode)
     }
 
     sfree(clipboard_contents);
+}
+
+static bool wintw_open_url(TermWin *tw, const char *url)
+{
+    WinGuiSeat *wgs = container_of(tw, WinGuiSeat, termwin);
+    HINSTANCE ret = ShellExecuteA(wgs->term_hwnd, "open", url, NULL, NULL,
+                                  SW_SHOWDEFAULT);
+    return (INT_PTR)ret > 32;
 }
 
 static void wintw_clip_request_paste(TermWin *tw, int clipboard)

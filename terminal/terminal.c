@@ -90,6 +90,7 @@ static void term_userpass_state_free(struct term_userpass_state *s);
  */
 static void resizeline(Terminal *, termline *, int);
 static termline *lineptr(Terminal *, int, int);
+static int line_cols(Terminal *, termline *);
 static void check_line_size(Terminal *, termline *);
 static void do_paint(Terminal *);
 static void erase_lots(Terminal *, bool, bool, bool);
@@ -7049,6 +7050,288 @@ void term_request_paste(Terminal *term, int clipboard)
         win_clip_request_paste(term->win, clipboard);
         break;
     }
+}
+
+typedef struct {
+    char *chars;
+    pos *positions;
+    size_t len, size;
+} url_scan_line;
+
+static void url_scan_add(url_scan_line *scan, char c, pos p)
+{
+    if (scan->len + 1 >= scan->size) {
+        scan->size = scan->size ? scan->size * 2 : 256;
+        scan->chars = sresize(scan->chars, scan->size, char);
+        scan->positions = sresize(scan->positions, scan->size, pos);
+    }
+    scan->chars[scan->len] = c;
+    scan->positions[scan->len] = p;
+    scan->len++;
+    scan->chars[scan->len] = '\0';
+}
+
+static void url_scan_free(url_scan_line *scan)
+{
+    sfree(scan->chars);
+    sfree(scan->positions);
+}
+
+static bool term_mouse_position(Terminal *term, int x, int y, pos *out)
+{
+    termline *ldata;
+    pos p;
+
+    if (x < 0 || x >= term->cols || y < 0 || y >= term->rows)
+        return false;
+
+    p.y = y + term->disptop;
+    ldata = lineptr(p.y);
+
+    if ((ldata->lattr & LATTR_MODE) != LATTR_NORM)
+        x /= 2;
+
+    if (term_bidi_line(term, ldata, y) != NULL)
+        x = term->post_bidi_cache[y].backward[x];
+
+    p.x = x;
+    unlineptr(ldata);
+
+    *out = p;
+    return true;
+}
+
+static char termchar_url_char(Terminal *term, termline *ldata, int x)
+{
+    unsigned long uc = ldata->chars[x].chr;
+
+    if (uc == UCSWIDE || uc == TRUST_SIGIL_CHAR)
+        return ' ';
+
+    switch (uc & CSET_MASK) {
+      case CSET_LINEDRW:
+        if (!term->rawcnp) {
+            uc = term->ucsdata->unitab_xterm[uc & 0xFF];
+            break;
+        }
+      case CSET_ASCII:
+        uc = term->ucsdata->unitab_line[uc & 0xFF];
+        break;
+      case CSET_SCOACS:
+        uc = term->ucsdata->unitab_scoacs[uc & 0xFF];
+        break;
+    }
+    switch (uc & CSET_MASK) {
+      case CSET_ACP:
+        uc = term->ucsdata->unitab_font[uc & 0xFF];
+        break;
+      case CSET_OEMCP:
+        uc = term->ucsdata->unitab_oemcp[uc & 0xFF];
+        break;
+    }
+
+    if (DIRECT_CHAR(uc) || DIRECT_FONT(uc))
+        uc &= ~CSET_MASK;
+
+    return (uc >= 0x21 && uc <= 0x7E) ? (char)uc : ' ';
+}
+
+static bool collect_url_scan_line(
+    Terminal *term, pos click, url_scan_line *scan, size_t *click_index)
+{
+    int start_y = click.y, end_y = click.y, top_y = -sblines(term);
+    bool found_click = false;
+
+    memset(scan, 0, sizeof(*scan));
+
+    while (start_y > top_y) {
+        termline *prev = lineptr(start_y - 1);
+        bool wrapped = (prev->lattr & LATTR_WRAPPED) != 0;
+        unlineptr(prev);
+        if (!wrapped)
+            break;
+        start_y--;
+    }
+
+    while (end_y + 1 < term->rows) {
+        termline *line = lineptr(end_y);
+        bool wrapped = (line->lattr & LATTR_WRAPPED) != 0;
+        unlineptr(line);
+        if (!wrapped)
+            break;
+        end_y++;
+    }
+
+    for (int y = start_y; y <= end_y; y++) {
+        termline *line = lineptr(y);
+        int cols = line_cols(term, line);
+
+        for (int x = 0; x < cols; x++) {
+            pos here;
+            here.y = y;
+            here.x = x;
+            if (poseq(here, click)) {
+                *click_index = scan->len;
+                found_click = true;
+            }
+            url_scan_add(scan, termchar_url_char(term, line, x), here);
+        }
+
+        unlineptr(line);
+    }
+
+    return found_click;
+}
+
+static bool url_startswith(const char *s, size_t len, size_t pos,
+                           const char *prefix)
+{
+    for (size_t i = 0; prefix[i]; i++) {
+        if (pos + i >= len)
+            return false;
+        if (tolower((unsigned char)s[pos + i]) != prefix[i])
+            return false;
+    }
+    return true;
+}
+
+static size_t url_prefix_len_at(const char *s, size_t len, size_t pos)
+{
+    if (url_startswith(s, len, pos, "https://"))
+        return 8;
+    if (url_startswith(s, len, pos, "http://"))
+        return 7;
+    return 0;
+}
+
+static bool url_body_char(char c)
+{
+    switch (c) {
+      case '\"':
+      case '\'':
+      case '`':
+      case '<':
+      case '>':
+      case '\\':
+        return false;
+      default:
+        return c > ' ' && c < 0x7F;
+    }
+}
+
+static bool url_closing_punct_unmatched(
+    const char *s, size_t start, size_t end, char opener, char closer)
+{
+    int balance = 0;
+
+    for (size_t i = start; i + 1 < end; i++) {
+        if (s[i] == opener) {
+            balance++;
+        } else if (s[i] == closer && balance > 0) {
+            balance--;
+        }
+    }
+
+    return balance == 0;
+}
+
+static size_t url_trim_end(const char *s, size_t start, size_t end)
+{
+    while (end > start) {
+        switch (s[end - 1]) {
+          case '.':
+          case ',':
+          case ';':
+          case ':':
+          case '!':
+          case '?':
+            end--;
+            break;
+          case ')':
+            if (url_closing_punct_unmatched(s, start, end, '(', ')'))
+                end--;
+            else
+                return end;
+            break;
+          case ']':
+            if (url_closing_punct_unmatched(s, start, end, '[', ']'))
+                end--;
+            else
+                return end;
+            break;
+          case '}':
+            if (url_closing_punct_unmatched(s, start, end, '{', '}'))
+                end--;
+            else
+                return end;
+            break;
+          default:
+            return end;
+        }
+    }
+
+    return end;
+}
+
+static char *term_find_url_at_pos(Terminal *term, pos click)
+{
+    url_scan_line scan;
+    size_t click_index = 0;
+    char *url = NULL;
+
+    if (!collect_url_scan_line(term, click, &scan, &click_index)) {
+        url_scan_free(&scan);
+        return NULL;
+    }
+
+    for (size_t start = 0; start < scan.len; start++) {
+        size_t prefix_len = url_prefix_len_at(scan.chars, scan.len, start);
+        size_t end, trimmed_end, url_len;
+
+        if (!prefix_len)
+            continue;
+
+        end = start + prefix_len;
+        while (end < scan.len && url_body_char(scan.chars[end]))
+            end++;
+
+        trimmed_end = url_trim_end(scan.chars, start, end);
+        if (trimmed_end <= start + prefix_len)
+            continue;
+
+        if (click_index < start || click_index >= trimmed_end)
+            continue;
+
+        url_len = trimmed_end - start;
+        url = snewn(url_len + 1, char);
+        memcpy(url, scan.chars + start, url_len);
+        url[url_len] = '\0';
+        break;
+    }
+
+    url_scan_free(&scan);
+    return url;
+}
+
+bool term_open_url_at(Terminal *term, int x, int y)
+{
+    pos click;
+    char *url;
+    bool opened;
+
+    if (!term->win || !term->win->vt->open_url)
+        return false;
+
+    if (!term_mouse_position(term, x, y, &click))
+        return false;
+
+    url = term_find_url_at_pos(term, click);
+    if (!url)
+        return false;
+
+    opened = win_open_url(term->win, url);
+    sfree(url);
+    return opened;
 }
 
 /*

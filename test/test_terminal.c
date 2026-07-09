@@ -32,6 +32,7 @@ typedef struct Mock {
     Conf *conf;
     struct unicode_data ucsdata[1];
     strbuf *title;
+    strbuf *opened_url;
 
     strbuf *context;
 
@@ -52,6 +53,7 @@ static void mock_palette_set(TermWin *win, unsigned start, unsigned ncolours,
                              const rgb *colours) {}
 static void mock_palette_get_overrides(TermWin *tw, Terminal *term) {}
 static void mock_set_title(TermWin *win, const char *title, int codepage);
+static bool mock_open_url(TermWin *win, const char *url);
 static void mock_set_icon_title(TermWin *win, const char *title, int cp) {}
 
 static const TermWinVtable mock_termwin_vt = {
@@ -64,6 +66,7 @@ static const TermWinVtable mock_termwin_vt = {
     .set_raw_mouse_mode_pointer = mock_set_raw_mouse_mode_pointer,
     .palette_set = mock_palette_set,
     .palette_get_overrides = mock_palette_get_overrides,
+    .open_url = mock_open_url,
 };
 
 static Mock *mock_new(void)
@@ -79,6 +82,7 @@ static Mock *mock_new(void)
 
     mk->context = strbuf_new();
     mk->title = strbuf_new();
+    mk->opened_url = strbuf_new();
 
     mk->tw.vt = &mock_termwin_vt;
 
@@ -91,6 +95,7 @@ static void mock_free(Mock *mk)
     conf_free(mk->conf);
     term_free(mk->term);
     strbuf_free(mk->title);
+    strbuf_free(mk->opened_url);
     sfree(mk);
 }
 
@@ -101,6 +106,14 @@ static void mock_set_title(TermWin *win, const char *title, int codepage)
     put_dataz(mk->title, title);
 }
 
+static bool mock_open_url(TermWin *win, const char *url)
+{
+    Mock *mk = container_of(win, Mock, tw);
+    strbuf_clear(mk->opened_url);
+    put_dataz(mk->opened_url, url);
+    return true;
+}
+
 static void reset(Mock *mk)
 {
     term_pwron(mk->term, true);
@@ -108,6 +121,7 @@ static void reset(Mock *mk)
     term_set_trust_status(mk->term, false);
     strbuf_clear(mk->context);
     strbuf_clear(mk->title);
+    strbuf_clear(mk->opened_url);
 }
 
 #if 0
@@ -524,6 +538,25 @@ static void test_wintitle(Mock *mk)
     SEQUAL(mk->title->s, "bar");
 }
 
+static void test_open_url(Mock *mk)
+{
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL(
+        "visit https://example.com/path), now"));
+    IEQUAL(term_open_url_at(mk->term, 8, 0), true);
+    SEQUAL(mk->opened_url->s, "https://example.com/path");
+    strbuf_clear(mk->opened_url);
+    IEQUAL(term_open_url_at(mk->term, 31, 0), false);
+    SEQUAL(mk->opened_url->s, "");
+
+    reset(mk);
+    term_size(mk->term, 24, 20, 0);
+    term_datapl(mk->term, PTRLEN_LITERAL(
+        "xx https://example.com/wrapped"));
+    IEQUAL(term_open_url_at(mk->term, 5, 1), true);
+    SEQUAL(mk->opened_url->s, "https://example.com/wrapped");
+}
+
 int main(void)
 {
     Mock *mk = mock_new();
@@ -533,6 +566,7 @@ int main(void)
     test_wrap(mk);
     test_nonwrap(mk);
     test_wintitle(mk);
+    test_open_url(mk);
 
     bool failed = mk->any_test_failed;
     mock_free(mk);

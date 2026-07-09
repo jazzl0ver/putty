@@ -2286,6 +2286,10 @@ static gboolean button_internal(GtkFrontend *inst, GdkEventButton *event)
     x = (event->x - inst->window_border) / inst->font_width;
     y = (event->y - inst->window_border) / inst->font_height;
 
+    if (button == MBT_LEFT && act == MA_CLICK && ctrl && shift &&
+        term_open_url_at(inst->term, x, y))
+        return true;
+
     term_mouse(inst->term, button, translate_button(button), act,
                x, y, shift, ctrl, alt);
 
@@ -2836,6 +2840,54 @@ static void gtkwin_palette_get_overrides(TermWin *tw, Terminal *term)
     /* GTK has no analogue of Windows's 'standard system colours', so GTK PuTTY
      * has no config option to override the normally configured colours from
      * it */
+}
+
+static bool gtkwin_open_url(TermWin *tw, const char *url)
+{
+    GtkFrontend *inst = container_of(tw, GtkFrontend, termwin);
+
+#if GTK_CHECK_VERSION(3,22,0)
+    GError *error = NULL;
+    gboolean ok = gtk_show_uri_on_window(GTK_WINDOW(inst->window), url,
+                                         inst->input_event_time, &error);
+    if (error)
+        g_error_free(error);
+    return ok;
+#elif GTK_CHECK_VERSION(2,14,0)
+    GError *error = NULL;
+    gboolean ok = gtk_show_uri(gtk_widget_get_screen(inst->window), url,
+                               inst->input_event_time, &error);
+    if (error)
+        g_error_free(error);
+    return ok;
+#else
+    const char *opener;
+    pid_t pid;
+
+#ifdef OSX_GTK
+    opener = "open";
+#else
+    opener = "xdg-open";
+#endif
+
+    pid = fork();
+    if (pid < 0)
+        return false;
+    if (pid == 0) {
+        pid_t pid2 = fork();
+        if (pid2 < 0)
+            _exit(127);
+        if (pid2 > 0)
+            _exit(0);
+        setsid();
+        execlp(opener, opener, url, (char *)NULL);
+        _exit(127);
+    }
+
+    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+        ;
+    return true;
+#endif
 }
 
 static struct clipboard_state *clipboard_from_atom(
@@ -5311,6 +5363,7 @@ static const TermWinVtable gtk_termwin_vt = {
     .bell = gtkwin_bell,
     .clip_write = gtkwin_clip_write,
     .clip_request_paste = gtkwin_clip_request_paste,
+    .open_url = gtkwin_open_url,
     .refresh = gtkwin_refresh,
     .request_resize = gtkwin_request_resize,
     .set_title = gtkwin_set_title,
