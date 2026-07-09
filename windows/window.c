@@ -96,6 +96,9 @@
 #ifndef VK_PACKET
 #define VK_PACKET 0xE7
 #endif
+#ifndef IDC_HAND
+#define IDC_HAND MAKEINTRESOURCE(32649)
+#endif
 
 static Mouse_Button translate_button(WinGuiSeat *wgs, Mouse_Button button);
 static void show_mouseptr(WinGuiSeat *wgs, bool show);
@@ -1158,7 +1161,9 @@ static void update_mouse_pointer(WinGuiSeat *wgs)
     static bool forced_visible = false;
     switch (wgs->busy_status) {
       case BUSY_NOT:
-        if (wgs->pointer_indicates_raw_mouse)
+        if (wgs->pointer_indicates_url)
+            curstype = IDC_HAND;
+        else if (wgs->pointer_indicates_raw_mouse)
             curstype = IDC_ARROW;
         else
             curstype = IDC_IBEAM;
@@ -1206,6 +1211,15 @@ static void wintw_set_raw_mouse_mode_pointer(TermWin *tw, bool activate)
 {
     WinGuiSeat *wgs = container_of(tw, WinGuiSeat, termwin);
     wgs->pointer_indicates_raw_mouse = activate;
+    update_mouse_pointer(wgs);
+}
+
+static void win_set_url_pointer(WinGuiSeat *wgs, bool active)
+{
+    if (wgs->pointer_indicates_url == active)
+        return;
+
+    wgs->pointer_indicates_url = active;
     update_mouse_pointer(wgs);
 }
 
@@ -2891,8 +2905,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                 int y = TO_CHR_Y(Y_POS(lParam));
 
                 if (button == MBT_LEFT && (wParam & MK_CONTROL) &&
-                    (wParam & MK_SHIFT) && term_open_url_at(wgs->term, x, y)) {
+                    (wParam & MK_SHIFT)) {
+                    wgs->url_click_pending = true;
                     wgs->lastbtn = MBT_NOTHING;
+                    SetCapture(hwnd);
                     return 0;
                 }
 
@@ -2901,9 +2917,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                       is_alt_pressed());
                 SetCapture(hwnd);
             } else {
+                int x = TO_CHR_X(X_POS(lParam));
+                int y = TO_CHR_Y(Y_POS(lParam));
+
+                if (button == MBT_LEFT && wgs->url_click_pending) {
+                    wgs->url_click_pending = false;
+                    if ((wParam & MK_CONTROL) && (wParam & MK_SHIFT))
+                        term_open_url_at(wgs->term, x, y);
+                    win_set_url_pointer(
+                        wgs, term_update_url_hover_at(wgs->term, x, y));
+                    if (!(wParam & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON)))
+                        ReleaseCapture();
+                    return 0;
+                }
+
                 term_mouse(wgs->term, button, translate_button(wgs, button),
-                           MA_RELEASE, TO_CHR_X(X_POS(lParam)),
-                           TO_CHR_Y(Y_POS(lParam)), wParam & MK_SHIFT,
+                           MA_RELEASE, x, y, wParam & MK_SHIFT,
                            wParam & MK_CONTROL, is_alt_pressed());
                 if (!(wParam & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON)))
                     ReleaseCapture();
@@ -2932,6 +2961,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
 
         if (wParam & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON) &&
             GetCapture() == hwnd) {
+            int x = TO_CHR_X(X_POS(lParam));
+            int y = TO_CHR_Y(Y_POS(lParam));
+
+            if (wgs->url_click_pending)
+                return 0;
+
             Mouse_Button b;
             if (wParam & MK_LBUTTON)
                 b = MBT_LEFT;
@@ -2940,17 +2975,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             else
                 b = MBT_RIGHT;
             term_mouse(wgs->term, b, translate_button(wgs, b), MA_DRAG,
-                       TO_CHR_X(X_POS(lParam)),
-                       TO_CHR_Y(Y_POS(lParam)), wParam & MK_SHIFT,
-                       wParam & MK_CONTROL, is_alt_pressed());
+                       x, y, wParam & MK_SHIFT, wParam & MK_CONTROL,
+                       is_alt_pressed());
         } else {
+            int x = TO_CHR_X(X_POS(lParam));
+            int y = TO_CHR_Y(Y_POS(lParam));
+            win_set_url_pointer(
+                wgs, term_update_url_hover_at(wgs->term, x, y));
             term_mouse(wgs->term, MBT_NOTHING, MBT_NOTHING, MA_MOVE,
-                       TO_CHR_X(X_POS(lParam)),
-                       TO_CHR_Y(Y_POS(lParam)), false,
-                       false, false);
+                       x, y, false, false, false);
         }
         return 0;
       case WM_NCMOUSEMOVE:
+        win_set_url_pointer(wgs, false);
+        term_update_url_hover_at(wgs->term, -1, -1);
         if (wgs->last_mousemove != WM_NCMOUSEMOVE ||
             wParam != wgs->last_wm_ncmousemove_wParam ||
             lParam != wgs->last_wm_ncmousemove_lParam) {

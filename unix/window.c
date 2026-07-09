@@ -121,6 +121,7 @@ struct GtkFrontend {
     GtkIMContext *imc;
 #endif
     unifont *fonts[4];                 /* normal, bold, wide, widebold */
+    GdkCursor *urlcursor;
     int xpos, ypos, gravity;
     bool gotpos;
     GdkCursor *rawcursor, *textcursor, *blankcursor, *waitcursor, *currcursor;
@@ -172,6 +173,8 @@ struct GtkFrontend {
 #endif
     bool send_raw_mouse;
     bool pointer_indicates_raw_mouse;
+    bool pointer_indicates_url;
+    bool url_click_pending;
     unifont_drawctx uctx;
 #if GTK_CHECK_VERSION(2,0,0)
     GdkPixbuf *trust_sigil_pb;
@@ -696,6 +699,9 @@ static void update_mouseptr(GtkFrontend *inst)
         if (!inst->mouseptr_visible) {
             gdk_window_set_cursor(gtk_widget_get_window(inst->area),
                                   inst->blankcursor);
+        } else if (inst->pointer_indicates_url) {
+            gdk_window_set_cursor(gtk_widget_get_window(inst->area),
+                                  inst->urlcursor);
         } else if (inst->pointer_indicates_raw_mouse) {
             gdk_window_set_cursor(gtk_widget_get_window(inst->area),
                                   inst->rawcursor);
@@ -2259,6 +2265,7 @@ static gboolean button_internal(GtkFrontend *inst, GdkEventButton *event)
         return true;
     }
 
+
     if (event->button == 1)
         button = MBT_LEFT;
     else if (event->button == 2)
@@ -2286,9 +2293,22 @@ static gboolean button_internal(GtkFrontend *inst, GdkEventButton *event)
     x = (event->x - inst->window_border) / inst->font_width;
     y = (event->y - inst->window_border) / inst->font_height;
 
-    if (button == MBT_LEFT && act == MA_CLICK && ctrl && shift &&
-        term_open_url_at(inst->term, x, y))
+    if (button == MBT_LEFT && act == MA_CLICK && ctrl && shift) {
+        inst->url_click_pending = true;
         return true;
+    }
+
+    if (button == MBT_LEFT && act == MA_RELEASE && inst->url_click_pending) {
+        inst->url_click_pending = false;
+        if (ctrl && shift)
+            term_open_url_at(inst->term, x, y);
+        inst->pointer_indicates_url = term_update_url_hover_at(inst->term, x, y);
+        update_mouseptr(inst);
+        return true;
+    }
+
+    if (button == MBT_LEFT && act == MA_RELEASE)
+        inst->url_click_pending = false;
 
     term_mouse(inst->term, button, translate_button(button), act,
                x, y, shift, ctrl, alt);
@@ -2353,6 +2373,19 @@ gboolean scroll_event(GtkWidget *widget, GdkEventScroll *event, gpointer data)
 }
 #endif
 
+gint leave_event(GtkWidget *widget, GdkEventCrossing *event, gpointer data)
+{
+    GtkFrontend *inst = (GtkFrontend *)data;
+
+    term_update_url_hover_at(inst->term, -1, -1);
+    if (inst->pointer_indicates_url) {
+        inst->pointer_indicates_url = false;
+        update_mouseptr(inst);
+    }
+
+    return false;
+}
+
 gint motion_event(GtkWidget *widget, GdkEventMotion *event, gpointer data)
 {
     GtkFrontend *inst = (GtkFrontend *)data;
@@ -2383,6 +2416,14 @@ gint motion_event(GtkWidget *widget, GdkEventMotion *event, gpointer data)
 
     x = (event->x - inst->window_border) / inst->font_width;
     y = (event->y - inst->window_border) / inst->font_height;
+
+    if (action == MA_MOVE) {
+        bool over_url = term_update_url_hover_at(inst->term, x, y);
+        if (inst->pointer_indicates_url != over_url) {
+            inst->pointer_indicates_url = over_url;
+            update_mouseptr(inst);
+        }
+    }
 
     term_mouse(inst->term, button, translate_button(button), action,
                x, y, shift, ctrl, alt);
@@ -5657,6 +5698,8 @@ void new_session_window(Conf *conf, const char *geometry_string)
                      G_CALLBACK(button_event), inst);
     g_signal_connect(G_OBJECT(inst->area), "button_release_event",
                      G_CALLBACK(button_event), inst);
+    g_signal_connect(G_OBJECT(inst->area), "leave_notify_event",
+                     G_CALLBACK(leave_event), inst);
 #if GTK_CHECK_VERSION(2,0,0)
     g_signal_connect(G_OBJECT(inst->area), "scroll_event",
                      G_CALLBACK(scroll_event), inst);
@@ -5679,7 +5722,8 @@ void new_session_window(Conf *conf, const char *geometry_string)
     gtk_widget_add_events(GTK_WIDGET(inst->area),
                           GDK_KEY_PRESS_MASK | GDK_KEY_RELEASE_MASK |
                           GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
-                          GDK_POINTER_MOTION_MASK | GDK_BUTTON_MOTION_MASK
+                          GDK_POINTER_MOTION_MASK | GDK_BUTTON_MOTION_MASK |
+                          GDK_LEAVE_NOTIFY_MASK
 #if GTK_CHECK_VERSION(3,4,0)
                           | GDK_SMOOTH_SCROLL_MASK
 #endif
@@ -5770,6 +5814,7 @@ void new_session_window(Conf *conf, const char *geometry_string)
     inst->textcursor = make_mouse_ptr(inst, GDK_XTERM);
     inst->rawcursor = make_mouse_ptr(inst, GDK_LEFT_PTR);
     inst->waitcursor = make_mouse_ptr(inst, GDK_WATCH);
+    inst->urlcursor = make_mouse_ptr(inst, GDK_HAND2);
     inst->blankcursor = make_mouse_ptr(inst, -1);
     inst->currcursor = inst->textcursor;
     show_mouseptr(inst, true);

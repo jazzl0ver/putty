@@ -545,9 +545,22 @@ static void test_open_url(Mock *mk)
         "visit https://example.com/path), now"));
     IEQUAL(term_open_url_at(mk->term, 8, 0), true);
     SEQUAL(mk->opened_url->s, "https://example.com/path");
+    IEQUAL(term_update_url_hover_at(mk->term, 8, 0), true);
+    IEQUAL(mk->term->url_hover_active, true);
+    IEQUAL(mk->term->url_hover_start.x, 6);
+    IEQUAL(mk->term->url_hover_start.y, 0);
+    IEQUAL(mk->term->url_hover_end.x, 30);
+    IEQUAL(mk->term->url_hover_end.y, 0);
+    IEQUAL(term_update_url_hover_at(mk->term, 0, 0), false);
+    IEQUAL(mk->term->url_hover_active, false);
     strbuf_clear(mk->opened_url);
     IEQUAL(term_open_url_at(mk->term, 31, 0), false);
     SEQUAL(mk->opened_url->s, "");
+
+    reset(mk);
+    term_datapl(mk->term, PTRLEN_LITERAL("go www.example.com/path."));
+    IEQUAL(term_open_url_at(mk->term, 3, 0), true);
+    SEQUAL(mk->opened_url->s, "https://www.example.com/path");
 
     reset(mk);
     term_size(mk->term, 24, 20, 0);

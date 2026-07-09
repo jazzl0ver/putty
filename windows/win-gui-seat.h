@@ -119,6 +119,8 @@ struct WinGuiSeat {
     int wheel_accumulator;
 
     bool pointer_indicates_raw_mouse;
+    bool pointer_indicates_url;
+    bool url_click_pending;
 
     BusyStatus busy_status;
 

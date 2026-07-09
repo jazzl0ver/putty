@@ -106,6 +106,7 @@ static void scroll(Terminal *, int, int, int, bool);
 static void parse_optionalrgb(optionalrgb *out, unsigned *values);
 static void term_added_data(Terminal *term, bool);
 static void term_update_raw_mouse_mode(Terminal *term);
+static bool term_url_hover_contains(Terminal *term, pos p);
 static void term_out_cb(void *);
 static void format_forwarded_ports(strbuf *out, Conf *conf, bool dynamic);
 static char *format_window_title(Terminal *term, const char *pattern,
@@ -6394,6 +6395,9 @@ static void do_paint(Terminal *term)
             tattr = (tattr ^ rv
                      ^ (selected ? ATTR_REVERSE : 0));
 
+            if (term_url_hover_contains(term, scrpos))
+                tattr |= ATTR_UNDER;
+
             /* 'Real' blinking ? */
             if (term->blink_is_real && (tattr & ATTR_BLINK)) {
                 if (term->has_focus && term->tblinker) {
@@ -7058,6 +7062,17 @@ typedef struct {
     size_t len, size;
 } url_scan_line;
 
+typedef struct {
+    size_t len;
+    bool add_https;
+} url_prefix_match;
+
+typedef struct {
+    char *url;
+    pos start;
+    pos end;
+} found_url;
+
 static void url_scan_add(url_scan_line *scan, char c, pos p)
 {
     if (scan->len + 1 >= scan->size) {
@@ -7139,7 +7154,8 @@ static char termchar_url_char(Terminal *term, termline *ldata, int x)
 static bool collect_url_scan_line(
     Terminal *term, pos click, url_scan_line *scan, size_t *click_index)
 {
-    int start_y = click.y, end_y = click.y, top_y = -sblines(term);
+    int start_y = click.y, end_y = click.y;
+    int top_y = -sblines(term), bottom_y = term->disptop + term->rows - 1;
     bool found_click = false;
 
     memset(scan, 0, sizeof(*scan));
@@ -7153,7 +7169,7 @@ static bool collect_url_scan_line(
         start_y--;
     }
 
-    while (end_y + 1 < term->rows) {
+    while (end_y < bottom_y) {
         termline *line = lineptr(end_y);
         bool wrapped = (line->lattr & LATTR_WRAPPED) != 0;
         unlineptr(line);
@@ -7195,13 +7211,20 @@ static bool url_startswith(const char *s, size_t len, size_t pos,
     return true;
 }
 
-static size_t url_prefix_len_at(const char *s, size_t len, size_t pos)
+static url_prefix_match url_prefix_at(const char *s, size_t len, size_t pos)
 {
+    url_prefix_match match = { 0, false };
+
     if (url_startswith(s, len, pos, "https://"))
-        return 8;
+        match.len = 8;
     if (url_startswith(s, len, pos, "http://"))
-        return 7;
-    return 0;
+        match.len = 7;
+    if (url_startswith(s, len, pos, "www.")) {
+        match.len = 4;
+        match.add_https = true;
+    }
+
+    return match;
 }
 
 static bool url_body_char(char c)
@@ -7273,50 +7296,102 @@ static size_t url_trim_end(const char *s, size_t start, size_t end)
     return end;
 }
 
-static char *term_find_url_at_pos(Terminal *term, pos click)
+static bool term_find_url_at_pos(Terminal *term, pos click, found_url *found)
 {
     url_scan_line scan;
     size_t click_index = 0;
-    char *url = NULL;
+
+    memset(found, 0, sizeof(*found));
 
     if (!collect_url_scan_line(term, click, &scan, &click_index)) {
         url_scan_free(&scan);
-        return NULL;
+        return false;
     }
 
     for (size_t start = 0; start < scan.len; start++) {
-        size_t prefix_len = url_prefix_len_at(scan.chars, scan.len, start);
+        url_prefix_match prefix = url_prefix_at(scan.chars, scan.len, start);
         size_t end, trimmed_end, url_len;
+        size_t extra_len;
 
-        if (!prefix_len)
+        if (!prefix.len)
             continue;
 
-        end = start + prefix_len;
+        end = start + prefix.len;
         while (end < scan.len && url_body_char(scan.chars[end]))
             end++;
 
         trimmed_end = url_trim_end(scan.chars, start, end);
-        if (trimmed_end <= start + prefix_len)
+        if (trimmed_end <= start + prefix.len)
             continue;
 
         if (click_index < start || click_index >= trimmed_end)
             continue;
 
         url_len = trimmed_end - start;
-        url = snewn(url_len + 1, char);
-        memcpy(url, scan.chars + start, url_len);
-        url[url_len] = '\0';
+        extra_len = prefix.add_https ? strlen("https://") : 0;
+        found->url = snewn(extra_len + url_len + 1, char);
+        if (prefix.add_https)
+            memcpy(found->url, "https://", extra_len);
+        memcpy(found->url + extra_len, scan.chars + start, url_len);
+        found->url[extra_len + url_len] = '\0';
+        found->start = scan.positions[start];
+        found->end = scan.positions[trimmed_end - 1];
+        incpos(found->end);
         break;
     }
 
     url_scan_free(&scan);
-    return url;
+    return found->url != NULL;
+}
+
+static void term_set_url_hover(
+    Terminal *term, bool active, pos start, pos end)
+{
+    if (term->url_hover_active == active &&
+        (!active ||
+         (poseq(term->url_hover_start, start) &&
+          poseq(term->url_hover_end, end))))
+        return;
+
+    term->url_hover_active = active;
+    if (active) {
+        term->url_hover_start = start;
+        term->url_hover_end = end;
+    }
+
+    term_schedule_update(term);
+}
+
+static bool term_url_hover_contains(Terminal *term, pos p)
+{
+    return term->url_hover_active &&
+        posle(term->url_hover_start, p) && poslt(p, term->url_hover_end);
+}
+
+bool term_update_url_hover_at(Terminal *term, int x, int y)
+{
+    pos hover = { 0, 0 };
+    found_url found;
+
+    if (!term_mouse_position(term, x, y, &hover)) {
+        term_set_url_hover(term, false, hover, hover);
+        return false;
+    }
+
+    if (term_find_url_at_pos(term, hover, &found)) {
+        term_set_url_hover(term, true, found.start, found.end);
+        sfree(found.url);
+        return true;
+    }
+
+    term_set_url_hover(term, false, hover, hover);
+    return false;
 }
 
 bool term_open_url_at(Terminal *term, int x, int y)
 {
     pos click;
-    char *url;
+    found_url found;
     bool opened;
 
     if (!term->win || !term->win->vt->open_url)
@@ -7325,12 +7400,11 @@ bool term_open_url_at(Terminal *term, int x, int y)
     if (!term_mouse_position(term, x, y, &click))
         return false;
 
-    url = term_find_url_at_pos(term, click);
-    if (!url)
+    if (!term_find_url_at_pos(term, click, &found))
         return false;
 
-    opened = win_open_url(term->win, url);
-    sfree(url);
+    opened = win_open_url(term->win, found.url);
+    sfree(found.url);
     return opened;
 }
 

@@ -2031,6 +2031,7 @@ void term_clrsb(Terminal *);
 void term_mouse(Terminal *, Mouse_Button, Mouse_Button, Mouse_Action,
                 int, int, bool, bool, bool);
 bool term_open_url_at(Terminal *, int, int);
+bool term_update_url_hover_at(Terminal *, int, int);
 void term_cancel_selection_drag(Terminal *);
 void term_lost_clipboard_ownership(Terminal *, int clipboard);
 void term_update(Terminal *);
