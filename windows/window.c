@@ -45,6 +45,7 @@
 #define IDM_RECONF    0x0050
 #define IDM_CLRSB     0x0060
 #define IDM_RESET     0x0070
+#define IDM_WINSCP    0x0090
 #define IDM_HELP      0x0140
 #define IDM_ABOUT     0x0150
 #define IDM_SAVEDSESS 0x0160
@@ -113,6 +114,7 @@ static void deinit_fonts(WinGuiSeat *wgs);
 static void change_font_size(WinGuiSeat *wgs, int increment);
 static void set_input_locale(WinGuiSeat *wgs, HKL);
 static void update_savedsess_menu(WinGuiSeat *wgs);
+static void start_winscp(WinGuiSeat *wgs);
 static void init_winfuncs(void);
 
 static bool is_full_screen(WinGuiSeat *wgs);
@@ -358,6 +360,135 @@ static void start_backend(WinGuiSeat *wgs)
 
     wgs->session_closed = false;
     wgs->pending_restart = false;
+}
+
+static void append_windows_command_line_arg(strbuf *cmdline, const char *arg)
+{
+    const char *p = arg;
+    size_t backslashes = 0;
+
+    if (cmdline->len)
+        put_byte(cmdline, ' ');
+    put_byte(cmdline, '"');
+
+    while (*p) {
+        if (*p == '\\') {
+            backslashes++;
+        } else {
+            size_t i, count = backslashes;
+
+            if (*p == '"')
+                count = 2 * backslashes + 1;
+            for (i = 0; i < count; i++)
+                put_byte(cmdline, '\\');
+            backslashes = 0;
+            put_byte(cmdline, *p);
+        }
+        p++;
+    }
+
+    while (backslashes) {
+        put_data(cmdline, "\\\\", 2);
+        backslashes--;
+    }
+    put_byte(cmdline, '"');
+}
+
+static void start_winscp(WinGuiSeat *wgs)
+{
+    const char *host = conf_get_str(wgs->conf, CONF_host);
+    const char *username = conf_get_str_ambi(wgs->conf, CONF_username, NULL);
+    Filename *keyfile = conf_get_filename(wgs->conf, CONF_keyfile);
+    strbuf *url = strbuf_new(), *params = strbuf_new();
+    char *option;
+    wchar_t *wparams;
+    Filename *configured_winscp =
+        conf_get_filename(wgs->conf, CONF_winscp_path);
+    wchar_t winscp_path[32768], *last_separator;
+    const wchar_t *application = L"WinSCP.exe";
+    HINSTANCE result;
+    DWORD length;
+
+    if (conf_get_int(wgs->conf, CONF_protocol) != PROT_SSH || !*host) {
+        MessageBox(wgs->term_hwnd,
+                   "Start WinSCP is available only for SSH sessions.",
+                   appname, MB_OK | MB_ICONINFORMATION);
+        goto out;
+    }
+
+    put_dataz(url, "sftp://");
+    if (strchr(host, ':'))
+        put_fmt(url, "[%s]", host);
+    else
+        put_dataz(url, host);
+    put_fmt(url, ":%d/", conf_get_int(wgs->conf, CONF_port));
+    append_windows_command_line_arg(params, url->s);
+
+    if (*username) {
+        option = dupprintf("/username=%s", username);
+        append_windows_command_line_arg(params, option);
+        sfree(option);
+    }
+
+    if (keyfile && keyfile->utf8path[0]) {
+        option = dupprintf("/privatekey=%s", keyfile->utf8path);
+        append_windows_command_line_arg(params, option);
+        sfree(option);
+    }
+
+    wparams = dup_mb_to_wc(CP_UTF8, params->s);
+
+    if (configured_winscp->wpath[0]) {
+        application = configured_winscp->wpath;
+    } else {
+        length = GetModuleFileNameW(NULL, winscp_path, lenof(winscp_path));
+        if (length > 0 && length < lenof(winscp_path)) {
+            last_separator = wcsrchr(winscp_path, L'\\');
+            if (last_separator &&
+                last_separator - winscp_path + 11 < lenof(winscp_path)) {
+                memcpy(last_separator + 1, L"WinSCP.exe",
+                       11 * sizeof(wchar_t));
+                if (GetFileAttributesW(winscp_path) != INVALID_FILE_ATTRIBUTES)
+                    application = winscp_path;
+            }
+        }
+    }
+
+    result = ShellExecuteW(wgs->term_hwnd, L"open", application, wparams,
+                           NULL, SW_SHOWNORMAL);
+
+    if ((INT_PTR)result <= 32) {
+        OPENFILENAMEW of = { 0 };
+
+        wcscpy(winscp_path, L"WinSCP.exe");
+        of.lStructSize = sizeof(of);
+        of.hwndOwner = wgs->term_hwnd;
+        of.lpstrFilter =
+            L"WinSCP executable (WinSCP.exe)\0WinSCP.exe\0"
+            L"Executables (*.exe)\0*.exe\0All files\0*.*\0\0";
+        of.lpstrFile = winscp_path;
+        of.nMaxFile = lenof(winscp_path);
+        of.lpstrTitle = L"Locate WinSCP.exe";
+        of.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+        if (GetOpenFileNameW(&of)) {
+            Filename *selected = filename_from_wstr(winscp_path);
+            conf_set_filename(wgs->conf, CONF_winscp_path, selected);
+            filename_free(selected);
+
+            result = ShellExecuteW(wgs->term_hwnd, L"open", winscp_path,
+                                   wparams, NULL, SW_SHOWNORMAL);
+            if ((INT_PTR)result <= 32)
+                MessageBox(wgs->term_hwnd,
+                           "Unable to start the selected WinSCP executable.",
+                           appname, MB_OK | MB_ICONERROR);
+        }
+    }
+    sfree(wparams);
+
+  out:
+    strbuf_free(params);
+    strbuf_free(url);
 }
 
 static void close_session(void *vctx)
@@ -804,6 +935,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
             AppendMenu(m, MF_POPUP | MF_ENABLED, (UINT_PTR)wgs->savedsess_menu,
                        "Sa&ved Sessions");
             AppendMenu(m, MF_ENABLED, IDM_RECONF, "Chan&ge Settings...");
+            AppendMenu(m,
+                       (conf_get_int(wgs->conf, CONF_protocol) == PROT_SSH &&
+                        conf_get_str(wgs->conf, CONF_host)[0]) ?
+                       MF_ENABLED : MF_GRAYED,
+                       IDM_WINSCP, "Start &WinSCP");
             AppendMenu(m, MF_SEPARATOR, 0, 0);
             AppendMenu(m, MF_ENABLED, IDM_COPYALL, "C&opy All to Clipboard");
             AppendMenu(m, MF_ENABLED, IDM_CLRSB, "C&lear Scrollback");
@@ -2442,6 +2578,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             break;
           case IDM_SHOWLOG:
             showeventlog(hwnd);
+            break;
+          case IDM_WINSCP:
+            start_winscp(wgs);
             break;
           case IDM_NEWSESS:
           case IDM_DUPSESS:

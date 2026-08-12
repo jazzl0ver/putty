@@ -15,6 +15,10 @@ The Windows version adds session restart controls to the window menu.
 
 In standard PuTTY 0.84, a closed session cannot be restarted quickly from the same window: normally, you need to open a new window or select the saved session again.
 
+### Start WinSCP
+
+For SSH sessions, the Windows system and context menus contain a `Start WinSCP` item. It opens an SFTP connection using the current host, port, username, and private key. `WinSCP.exe` is discovered next to `PuTTY.exe` or through the standard Windows application registration. If it cannot be found, PuTTY opens a file picker. The executable can also be selected in `Window -> Behaviour -> WinSCP integration`; its path is stored with the session.
+
 ### KiTTY-style portable file storage
 
 An alternative Windows backend for storing settings in files has been added. The standard registry backend remains available and is used by default.

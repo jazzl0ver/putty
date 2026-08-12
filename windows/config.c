@@ -354,6 +354,13 @@ void win_setup_config_box(struct controlbox *b, HWND *hwndp, bool has_help,
                   conf_checkbox_handler,
                   I(CONF_fullscreenonaltenter));
 
+    s = ctrl_getset(b, "Window/Behaviour", "winscp",
+                    "WinSCP integration");
+    ctrl_filesel(s, "Path to WinSCP.exe:", NO_SHORTCUT,
+                 FILTER_ALL_FILES, false, "Select WinSCP executable",
+                 HELPCTX(no_help),
+                 conf_filesel_handler, I(CONF_winscp_path));
+
     /*
      * Windows supports a local-command proxy.
      */

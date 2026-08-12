@@ -241,6 +241,10 @@ CONF_OPTION(keyfile,
     VALUE_TYPE(FILENAME),
     SAVE_KEYWORD("PublicKeyFile"),
 )
+CONF_OPTION(winscp_path,
+    VALUE_TYPE(FILENAME),
+    SAVE_KEYWORD("WinSCPPath"),
+)
 CONF_OPTION(detached_cert,
     VALUE_TYPE(FILENAME),
     SAVE_KEYWORD("DetachedCertificate"),
