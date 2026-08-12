@@ -16,6 +16,7 @@ cmake_install.cmake
 .dirstamp
 .deps
 .DS_Store
+.claude
 /.vscode
 /*.pdb
 /*.ilk

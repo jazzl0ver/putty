@@ -20,7 +20,7 @@
 
 ### Start WinSCP
 
-Для SSH-сессий в системное и контекстное меню Windows добавлен пункт `Start WinSCP`. Он открывает SFTP-подключение с текущими host, port, username и private key. `WinSCP.exe` ищется рядом с `PuTTY.exe` или через стандартную регистрацию приложений Windows. Если программа не найдена, PuTTY открывает диалог выбора файла. Путь также можно указать в `Window -> Behaviour -> WinSCP integration`; он сохраняется вместе с сессией.
+Для SSH-сессий в системное и контекстное меню Windows добавлен пункт `Start WinSCP`. Он открывает SFTP-подключение с текущими host, port, username и private key. `WinSCP.exe` ищется рядом с `PuTTY.exe` или через стандартную регистрацию приложений Windows. Если программа не найдена, PuTTY открывает диалог выбора файла. Путь также можно указать в `Window -> Behaviour -> WinSCP integration`; он глобально сохраняется в ключе `WinSCPPath` файла `putty.ini`.
 
 ### Portable file storage в стиле KiTTY
 

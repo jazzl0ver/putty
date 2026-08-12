@@ -17,6 +17,7 @@
 #include "ssh.h"
 #include "terminal.h"
 #include "storage.h"
+#include "filestore.h"
 #include "putty-rc.h"
 #include "security-api.h"
 #include "win-gui-seat.h"
@@ -404,6 +405,7 @@ static void start_winscp(WinGuiSeat *wgs)
     wchar_t *wparams;
     Filename *configured_winscp =
         conf_get_filename(wgs->conf, CONF_winscp_path);
+    Filename *global_winscp = NULL;
     wchar_t winscp_path[32768], *last_separator;
     const wchar_t *application = L"WinSCP.exe";
     HINSTANCE result;
@@ -437,6 +439,11 @@ static void start_winscp(WinGuiSeat *wgs)
     }
 
     wparams = dup_mb_to_wc(CP_UTF8, params->s);
+
+    if (!configured_winscp->wpath[0]) {
+        global_winscp = win_load_winscp_path();
+        configured_winscp = global_winscp;
+    }
 
     if (configured_winscp->wpath[0]) {
         application = configured_winscp->wpath;
@@ -474,6 +481,7 @@ static void start_winscp(WinGuiSeat *wgs)
         if (GetOpenFileNameW(&of)) {
             Filename *selected = filename_from_wstr(winscp_path);
             conf_set_filename(wgs->conf, CONF_winscp_path, selected);
+            win_save_winscp_path(selected);
             filename_free(selected);
 
             result = ShellExecuteW(wgs->term_hwnd, L"open", winscp_path,
@@ -487,6 +495,8 @@ static void start_winscp(WinGuiSeat *wgs)
     sfree(wparams);
 
   out:
+    if (global_winscp)
+        filename_free(global_winscp);
     strbuf_free(params);
     strbuf_free(url);
 }

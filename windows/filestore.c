@@ -424,6 +424,45 @@ static bool kv_save_file_atomic(const char *path_utf8, kvpair *head)
     return true;
 }
 
+Filename *win_load_winscp_path(void)
+{
+    fs_init();
+    if (!fs_root_utf8)
+        return filename_from_str("");
+
+    char *path = dupcat(fs_root_utf8, "\\putty.ini");
+    kvpair *kv = kv_load_file(path);
+    kvpair *item = kv_find(kv, "WinSCPPath");
+    char *decoded = item ? kv_decode(item->value) : dupstr("");
+    wchar_t *wide = dup_mb_to_wc(CP_UTF8, decoded);
+    Filename *result = filename_from_wstr(wide);
+
+    sfree(wide);
+    sfree(decoded);
+    kv_free_all(kv);
+    sfree(path);
+    return result;
+}
+
+bool win_save_winscp_path(const Filename *winscp_path)
+{
+    fs_init();
+    if (!fs_root_utf8)
+        return false;
+
+    char *path = dupcat(fs_root_utf8, "\\putty.ini");
+    kvpair *kv = kv_load_file(path);
+    char *encoded = kv_encode(winscp_path ? winscp_path->utf8path : "");
+
+    kv_set(&kv, "WinSCPPath", encoded);
+    bool success = kv_save_file_atomic(path, kv);
+
+    sfree(encoded);
+    kv_free_all(kv);
+    sfree(path);
+    return success;
+}
+
 /* ----------------------------------------------------------------------
  * Sessions
  */

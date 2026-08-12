@@ -17,7 +17,7 @@ In standard PuTTY 0.84, a closed session cannot be restarted quickly from the sa
 
 ### Start WinSCP
 
-For SSH sessions, the Windows system and context menus contain a `Start WinSCP` item. It opens an SFTP connection using the current host, port, username, and private key. `WinSCP.exe` is discovered next to `PuTTY.exe` or through the standard Windows application registration. If it cannot be found, PuTTY opens a file picker. The executable can also be selected in `Window -> Behaviour -> WinSCP integration`; its path is stored with the session.
+For SSH sessions, the Windows system and context menus contain a `Start WinSCP` item. It opens an SFTP connection using the current host, port, username, and private key. `WinSCP.exe` is discovered next to `PuTTY.exe` or through the standard Windows application registration. If it cannot be found, PuTTY opens a file picker. The executable can also be selected in `Window -> Behaviour -> WinSCP integration`; its path is stored globally as the `WinSCPPath` key in `putty.ini`.
 
 ### KiTTY-style portable file storage
 
