@@ -18,6 +18,10 @@ bool win_use_file_storage(void);
  */
 char *win_file_storage_root(void);
 
+/* Global settings stored in root\putty.ini. */
+Filename *win_load_winscp_path(void);
+bool win_save_winscp_path(const Filename *path);
+
 /* Session settings */
 settings_w *fs_open_settings_w(const char *sessionname, char **errmsg);
 void fs_write_setting_s(settings_w *handle, const char *key, const char *value);

@@ -9,6 +9,25 @@
 #include "putty.h"
 #include "dialog.h"
 #include "storage.h"
+#include "filestore.h"
+
+static void winscp_path_handler(dlgcontrol *ctrl, dlgparam *dlg,
+                                void *data, int event)
+{
+    Conf *conf = (Conf *)data;
+
+    if (event == EVENT_REFRESH &&
+        !conf_get_filename(conf, CONF_winscp_path)->utf8path[0]) {
+        Filename *filename = win_load_winscp_path();
+        conf_set_filename(conf, CONF_winscp_path, filename);
+        filename_free(filename);
+    }
+
+    conf_filesel_handler(ctrl, dlg, data, event);
+
+    if (event == EVENT_VALCHANGE)
+        win_save_winscp_path(conf_get_filename(conf, CONF_winscp_path));
+}
 
 static void about_handler(dlgcontrol *ctrl, dlgparam *dlg,
                           void *data, int event)
@@ -359,7 +378,7 @@ void win_setup_config_box(struct controlbox *b, HWND *hwndp, bool has_help,
     ctrl_filesel(s, "Path to WinSCP.exe:", NO_SHORTCUT,
                  FILTER_ALL_FILES, false, "Select WinSCP executable",
                  HELPCTX(no_help),
-                 conf_filesel_handler, I(CONF_winscp_path));
+                 winscp_path_handler, I(CONF_winscp_path));
 
     /*
      * Windows supports a local-command proxy.

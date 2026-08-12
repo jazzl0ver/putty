@@ -738,6 +738,10 @@ void load_open_settings(settings_r *sesskey, Conf *conf)
     int i;
     char *prot;
 
+    Filename *empty_winscp_path = filename_from_str("");
+    conf_set_filename(conf, CONF_winscp_path, empty_winscp_path);
+    filename_free(empty_winscp_path);
+
     /* Load the settings simple enough to handle automatically */
     for (size_t key = 0; key < N_CONFIG_OPTIONS; key++) {
         const ConfKeyInfo *info = &conf_key_info[key];

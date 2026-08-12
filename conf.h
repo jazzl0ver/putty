@@ -243,7 +243,7 @@ CONF_OPTION(keyfile,
 )
 CONF_OPTION(winscp_path,
     VALUE_TYPE(FILENAME),
-    SAVE_KEYWORD("WinSCPPath"),
+    LOAD_CUSTOM, SAVE_CUSTOM,
 )
 CONF_OPTION(detached_cert,
     VALUE_TYPE(FILENAME),
