@@ -690,6 +690,33 @@ void save_open_settings(settings_w *sesskey, Conf *conf)
     wmap(sesskey, "SSHManualHostKeys", conf, CONF_ssh_manual_hostkeys, false);
 }
 
+void save_window_pos_settings(Conf *conf, int x, int y, int width, int height)
+{
+    if (!conf_get_bool(conf, CONF_save_window_pos))
+        return;
+
+    const char *session = conf_get_str(conf, CONF_session_name);
+    const char *save_session = (!session || !*session ||
+                                !strcmp(session, "Default Settings")) ?
+        "" : session;
+
+    settings_r *sesskey = open_settings_r(save_session);
+
+    Conf *saveconf = conf_new();
+    load_open_settings(sesskey, saveconf);
+    if (sesskey)
+        close_settings_r(sesskey);
+
+    conf_set_int(saveconf, CONF_width, width);
+    conf_set_int(saveconf, CONF_height, height);
+    conf_set_int(saveconf, CONF_window_xpos, x);
+    conf_set_int(saveconf, CONF_window_ypos, y);
+
+    char *errmsg = save_settings(save_session, saveconf);
+    sfree(errmsg);
+    conf_free(saveconf);
+}
+
 bool load_settings(const char *section, Conf *conf)
 {
     settings_r *sesskey;
@@ -698,6 +725,7 @@ bool load_settings(const char *section, Conf *conf)
     bool exists = (sesskey != NULL);
     load_open_settings(sesskey, conf);
     close_settings_r(sesskey);
+    conf_set_str(conf, CONF_session_name, (exists && section) ? section : "");
 
     if (exists && conf_launchable(conf))
         add_session_to_jumplist(section);
@@ -709,6 +737,10 @@ void load_open_settings(settings_r *sesskey, Conf *conf)
 {
     int i;
     char *prot;
+
+    Filename *empty_winscp_path = filename_from_str("");
+    conf_set_filename(conf, CONF_winscp_path, empty_winscp_path);
+    filename_free(empty_winscp_path);
 
     /* Load the settings simple enough to handle automatically */
     for (size_t key = 0; key < N_CONFIG_OPTIONS; key++) {

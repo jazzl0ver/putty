@@ -779,19 +779,219 @@ static void sshbug_handler_manual_only(dlgcontrol *ctrl, dlgparam *dlg,
     }
 }
 
+enum sessionsaver_viewrow_type {
+    SESSIONVIEW_PARENT,
+    SESSIONVIEW_FOLDER,
+    SESSIONVIEW_SESSION,
+};
+
+struct sessionsaver_viewrow {
+    enum sessionsaver_viewrow_type type;
+    char *full_name;
+};
+
 struct sessionsaver_data {
     dlgcontrol *editbox, *listbox, *loadbutton, *savebutton, *delbutton;
     dlgcontrol *okbutton, *cancelbutton;
     struct sesslist sesslist;
     bool midsession;
     char *savedsession;     /* the current contents of ssd->editbox */
+    char *folder;           /* folder currently shown in ssd->listbox */
+    struct sessionsaver_viewrow *viewrows;
+    size_t nviewrows, viewrowsize;
 };
+
+static bool sessionsaver_is_pathsep(char c)
+{
+    return c == '/' || c == '\\';
+}
+
+static const char *sessionsaver_first_pathsep(const char *s)
+{
+    const char *slash = strchr(s, '/');
+    const char *bslash = strchr(s, '\\');
+    return (slash && (!bslash || slash < bslash)) ? slash : bslash;
+}
+
+static const char *sessionsaver_last_pathsep(const char *s)
+{
+    const char *slash = strrchr(s, '/');
+    const char *bslash = strrchr(s, '\\');
+    return (slash && (!bslash || slash > bslash)) ? slash : bslash;
+}
+
+static const char *sessionsaver_basename(const char *s)
+{
+    const char *sep = sessionsaver_last_pathsep(s);
+    return sep ? sep + 1 : s;
+}
+
+static char *sessionsaver_parent_folder(const char *s)
+{
+    const char *sep = sessionsaver_last_pathsep(s);
+    return sep ? dupprintf("%.*s", (int)(sep - s), s) : dupstr("");
+}
+
+static char *sessionsaver_join_folder(const char *folder,
+                                      const char *name, size_t namelen)
+{
+    return *folder ? dupprintf("%s/%.*s", folder, (int)namelen, name) :
+        dupprintf("%.*s", (int)namelen, name);
+}
+
+static bool sessionsaver_session_in_folder(
+    const char *session, const char *folder, const char **tail)
+{
+    size_t folderlen = strlen(folder);
+
+    if (!folderlen) {
+        *tail = session;
+        return true;
+    }
+
+    if (strncmp(session, folder, folderlen))
+        return false;
+    if (!sessionsaver_is_pathsep(session[folderlen]))
+        return false;
+
+    *tail = session + folderlen + 1;
+    return **tail != '\0';
+}
+
+static void sessionsaver_clear_view(struct sessionsaver_data *ssd)
+{
+    for (size_t i = 0; i < ssd->nviewrows; i++)
+        sfree(ssd->viewrows[i].full_name);
+    sfree(ssd->viewrows);
+    ssd->viewrows = NULL;
+    ssd->nviewrows = ssd->viewrowsize = 0;
+}
+
+static void sessionsaver_add_viewrow(
+    struct sessionsaver_data *ssd, enum sessionsaver_viewrow_type type,
+    const char *full_name)
+{
+    sgrowarray(ssd->viewrows, ssd->viewrowsize, ssd->nviewrows);
+    ssd->viewrows[ssd->nviewrows].type = type;
+    ssd->viewrows[ssd->nviewrows].full_name = dupstr(full_name);
+    ssd->nviewrows++;
+}
+
+static bool sessionsaver_has_folder_row(
+    struct sessionsaver_data *ssd, const char *folder)
+{
+    for (size_t i = 0; i < ssd->nviewrows; i++) {
+        if (ssd->viewrows[i].type == SESSIONVIEW_FOLDER &&
+            !strcmp(ssd->viewrows[i].full_name, folder))
+            return true;
+    }
+    return false;
+}
+
+static void sessionsaver_build_view(struct sessionsaver_data *ssd)
+{
+    sessionsaver_clear_view(ssd);
+
+    if (*ssd->folder) {
+        char *parent = sessionsaver_parent_folder(ssd->folder);
+        sessionsaver_add_viewrow(ssd, SESSIONVIEW_PARENT, parent);
+        sfree(parent);
+    }
+
+    for (int pass = 0; pass < 2; pass++) {
+        bool want_folders = (pass == 0);
+
+        for (int i = 0; i < ssd->sesslist.nsessions; i++) {
+            const char *session = ssd->sesslist.sessions[i];
+            const char *tail;
+
+            if (!strcmp(session, "Default Settings")) {
+                if (!want_folders && !*ssd->folder)
+                    sessionsaver_add_viewrow(
+                        ssd, SESSIONVIEW_SESSION, session);
+                continue;
+            }
+
+            if (!sessionsaver_session_in_folder(session, ssd->folder, &tail))
+                continue;
+
+            const char *sep = sessionsaver_first_pathsep(tail);
+            if (sep) {
+                if (want_folders) {
+                    char *folder = sessionsaver_join_folder(
+                        ssd->folder, tail, sep - tail);
+                    if (!sessionsaver_has_folder_row(ssd, folder))
+                        sessionsaver_add_viewrow(
+                            ssd, SESSIONVIEW_FOLDER, folder);
+                    sfree(folder);
+                }
+            } else if (!want_folders) {
+                sessionsaver_add_viewrow(ssd, SESSIONVIEW_SESSION, session);
+            }
+        }
+    }
+}
+
+static char *sessionsaver_viewrow_display(
+    struct sessionsaver_data *ssd, struct sessionsaver_viewrow *row)
+{
+    switch (row->type) {
+      case SESSIONVIEW_PARENT:
+        return dupstr("..");
+      case SESSIONVIEW_FOLDER:
+        return dupprintf("%s/", sessionsaver_basename(row->full_name));
+      case SESSIONVIEW_SESSION:
+        return dupstr(*ssd->folder ? sessionsaver_basename(row->full_name) :
+                      row->full_name);
+    }
+    unreachable("bad saved-session view row type");
+}
+
+static int sessionsaver_find_session_index(
+    struct sessionsaver_data *ssd, const char *session)
+{
+    for (int i = 0; i < ssd->sesslist.nsessions; i++)
+        if (!strcmp(ssd->sesslist.sessions[i], session))
+            return i;
+    return -1;
+}
+
+static int sessionsaver_find_view_session(
+    struct sessionsaver_data *ssd, const char *session)
+{
+    for (size_t i = 0; i < ssd->nviewrows; i++) {
+        if (ssd->viewrows[i].type == SESSIONVIEW_SESSION &&
+            !strcmp(ssd->viewrows[i].full_name, session))
+            return (int)i;
+    }
+    return -1;
+}
+
+static void sessionsaver_set_folder(
+    struct sessionsaver_data *ssd, const char *folder)
+{
+    if (!strcmp(ssd->folder, folder))
+        return;
+    sfree(ssd->folder);
+    ssd->folder = dupstr(folder);
+}
+
+static char *sessionsaver_resolve_session_name(
+    struct sessionsaver_data *ssd, const char *session)
+{
+    if (*ssd->folder && !sessionsaver_first_pathsep(session) &&
+        strcmp(session, "Default Settings"))
+        return dupprintf("%s/%s", ssd->folder, session);
+    return dupstr(session);
+}
 
 static void sessionsaver_data_free(void *ssdv)
 {
     struct sessionsaver_data *ssd = (struct sessionsaver_data *)ssdv;
     get_sesslist(&ssd->sesslist, false);
     sfree(ssd->savedsession);
+    sfree(ssd->folder);
+    sessionsaver_clear_view(ssd);
     sfree(ssd);
 }
 
@@ -805,21 +1005,32 @@ static bool load_selected_session(
     dlgparam *dlg, Conf *conf, bool *maybe_launch)
 {
     int i = dlg_listbox_index(ssd->listbox, dlg);
-    bool isdef;
     if (i < 0) {
         dlg_beep(dlg);
         return false;
     }
-    isdef = !strcmp(ssd->sesslist.sessions[i], "Default Settings");
-    load_settings(ssd->sesslist.sessions[i], conf);
+
+    struct sessionsaver_viewrow *row = &ssd->viewrows[i];
+    if (row->type != SESSIONVIEW_SESSION) {
+        sessionsaver_set_folder(ssd, row->full_name);
+        dlg_refresh(ssd->listbox, dlg);
+        return false;
+    }
+
+    char *session = dupstr(row->full_name);
+    bool isdef = !strcmp(session, "Default Settings");
+    load_settings(session, conf);
     sfree(ssd->savedsession);
-    ssd->savedsession = dupstr(isdef ? "" : ssd->sesslist.sessions[i]);
+    ssd->savedsession = dupstr(isdef ? "" : session);
     if (maybe_launch)
         *maybe_launch = !isdef;
     dlg_refresh(NULL, dlg);
     /* Restore the selection, which might have been clobbered by
      * changing the value of the edit box. */
-    dlg_listbox_select(ssd->listbox, dlg, i);
+    i = sessionsaver_find_view_session(ssd, session);
+    sfree(session);
+    if (i >= 0)
+        dlg_listbox_select(ssd->listbox, dlg, i);
     return true;
 }
 
@@ -834,33 +1045,55 @@ static void sessionsaver_handler(dlgcontrol *ctrl, dlgparam *dlg,
         if (ctrl == ssd->editbox) {
             dlg_editbox_set(ctrl, dlg, ssd->savedsession);
         } else if (ctrl == ssd->listbox) {
-            int i;
             dlg_update_start(ctrl, dlg);
             dlg_listbox_clear(ctrl, dlg);
-            for (i = 0; i < ssd->sesslist.nsessions; i++)
-                dlg_listbox_add(ctrl, dlg, ssd->sesslist.sessions[i]);
+            sessionsaver_build_view(ssd);
+            for (size_t i = 0; i < ssd->nviewrows; i++) {
+                char *display = sessionsaver_viewrow_display(
+                    ssd, &ssd->viewrows[i]);
+                dlg_listbox_add(ctrl, dlg, display);
+                sfree(display);
+            }
             dlg_update_done(ctrl, dlg);
         }
     } else if (event == EVENT_VALCHANGE) {
-        int top, bottom, halfway, i;
         if (ctrl == ssd->editbox) {
             sfree(ssd->savedsession);
             ssd->savedsession = dlg_editbox_get(ctrl, dlg);
-            top = ssd->sesslist.nsessions;
-            bottom = -1;
+
+            char *session = sessionsaver_resolve_session_name(
+                ssd, ssd->savedsession);
+            if (sessionsaver_find_session_index(ssd, session) >= 0) {
+                char *folder = sessionsaver_parent_folder(session);
+                sessionsaver_set_folder(ssd, folder);
+                sfree(folder);
+                dlg_refresh(ssd->listbox, dlg);
+
+                int row = sessionsaver_find_view_session(ssd, session);
+                if (row >= 0)
+                    dlg_listbox_select(ssd->listbox, dlg, row);
+                sfree(session);
+                return;
+            }
+
+            int top = (int)ssd->nviewrows;
+            int bottom = -1;
             while (top-bottom > 1) {
-                halfway = (top+bottom)/2;
-                i = strcmp(ssd->savedsession, ssd->sesslist.sessions[halfway]);
-                if (i <= 0 ) {
+                int halfway = (top+bottom)/2;
+                int cmp = strcmp(
+                    session, ssd->viewrows[halfway].full_name);
+                if (cmp <= 0 ) {
                     top = halfway;
                 } else {
                     bottom = halfway;
                 }
             }
-            if (top == ssd->sesslist.nsessions) {
+            sfree(session);
+            if (top == (int)ssd->nviewrows) {
                 top -= 1;
             }
-            dlg_listbox_select(ssd->listbox, dlg, top);
+            if (top >= 0)
+                dlg_listbox_select(ssd->listbox, dlg, top);
         }
     } else if (event == EVENT_ACTION) {
         bool mbl = false;
@@ -879,25 +1112,34 @@ static void sessionsaver_handler(dlgcontrol *ctrl, dlgparam *dlg,
                 dlg_end(dlg, 1);       /* it's all over, and succeeded */
             }
         } else if (ctrl == ssd->savebutton) {
-            bool isdef = !strcmp(ssd->savedsession, "Default Settings");
+            char *save_session = NULL;
             if (!ssd->savedsession[0]) {
                 int i = dlg_listbox_index(ssd->listbox, dlg);
-                if (i < 0) {
+                if (i < 0 || ssd->viewrows[i].type != SESSIONVIEW_SESSION) {
                     dlg_beep(dlg);
                     return;
                 }
-                isdef = !strcmp(ssd->sesslist.sessions[i], "Default Settings");
-                sfree(ssd->savedsession);
-                ssd->savedsession = dupstr(isdef ? "" :
-                                           ssd->sesslist.sessions[i]);
+                save_session = dupstr(ssd->viewrows[i].full_name);
+            } else {
+                save_session = sessionsaver_resolve_session_name(
+                    ssd, ssd->savedsession);
             }
             {
-                char *errmsg = save_settings(ssd->savedsession, conf);
+                char *errmsg = save_settings(save_session, conf);
                 if (errmsg) {
                     dlg_error_msg(dlg, errmsg);
                     sfree(errmsg);
                 }
             }
+            sfree(ssd->savedsession);
+            ssd->savedsession = dupstr(
+                !strcmp(save_session, "Default Settings") ? "" : save_session);
+            {
+                char *folder = sessionsaver_parent_folder(save_session);
+                sessionsaver_set_folder(ssd, folder);
+                sfree(folder);
+            }
+            sfree(save_session);
             get_sesslist(&ssd->sesslist, false);
             get_sesslist(&ssd->sesslist, true);
             dlg_refresh(ssd->editbox, dlg);
@@ -905,10 +1147,11 @@ static void sessionsaver_handler(dlgcontrol *ctrl, dlgparam *dlg,
         } else if (!ssd->midsession &&
                    ssd->delbutton && ctrl == ssd->delbutton) {
             int i = dlg_listbox_index(ssd->listbox, dlg);
-            if (i <= 0) {
+            if (i < 0 || ssd->viewrows[i].type != SESSIONVIEW_SESSION ||
+                !strcmp(ssd->viewrows[i].full_name, "Default Settings")) {
                 dlg_beep(dlg);
             } else {
-                del_settings(ssd->sesslist.sessions[i]);
+                del_settings(ssd->viewrows[i].full_name);
                 get_sesslist(&ssd->sesslist, false);
                 get_sesslist(&ssd->sesslist, true);
                 dlg_refresh(ssd->listbox, dlg);
@@ -1801,6 +2044,7 @@ void setup_config_box(struct controlbox *b, bool midsession,
                              sessionsaver_data_free);
     memset(ssd, 0, sizeof(*ssd));
     ssd->savedsession = dupstr("");
+    ssd->folder = dupstr("");
     ssd->midsession = midsession;
 
     /*
@@ -2299,6 +2543,28 @@ void setup_config_box(struct controlbox *b, bool midsession,
     ctrl_editbox(s, "Window title:", 't', 100,
                  HELPCTX(appearance_title),
                  conf_editbox_handler, I(CONF_wintitle), ED_STR);
+    ctrl_columns(s, 2, 50, 50);
+    c = ctrl_text(s, "%%f: folder name", HELPCTX(appearance_title));
+    c->column = 0;
+    c = ctrl_text(s, "%%h: host name", HELPCTX(appearance_title));
+    c->column = 1;
+    c = ctrl_text(s, "%%p: port number", HELPCTX(appearance_title));
+    c->column = 0;
+    c = ctrl_text(s, "%%P: protocol name", HELPCTX(appearance_title));
+    c->column = 1;
+    c = ctrl_text(s, "%%s: session name", HELPCTX(appearance_title));
+    c->column = 0;
+    c = ctrl_text(s, "%%u: username", HELPCTX(appearance_title));
+    c->column = 1;
+    c = ctrl_text(s, "%%l: local forwarded ports list",
+                  HELPCTX(appearance_title));
+    c->column = 0;
+    c = ctrl_text(s, "%%d: dynamic forwarded ports list",
+                  HELPCTX(appearance_title));
+    c->column = 1;
+    c = ctrl_text(s, "%%: %", HELPCTX(appearance_title));
+    c->column = 0;
+    ctrl_columns(s, 1, 100);
     ctrl_checkbox(s, "Separate window and icon titles", 'i',
                   HELPCTX(appearance_title),
                   conf_checkbox_handler,
@@ -2308,6 +2574,9 @@ void setup_config_box(struct controlbox *b, bool midsession,
     ctrl_checkbox(s, "Warn before closing window", 'w',
                   HELPCTX(behaviour_closewarn),
                   conf_checkbox_handler, I(CONF_warn_on_close));
+    ctrl_checkbox(s, "Save position and size on exit", 's',
+                  HELPCTX(behaviour_save_window_pos),
+                  conf_checkbox_handler, I(CONF_save_window_pos));
 
     /*
      * The Window/Translation panel.

@@ -813,6 +813,9 @@ extern const int be_default_protocol;
  */
 extern const char *const appname;
 
+#define PATCHED_BY_DETAILS \
+    "2026: Patched by jazzl0ver (https://github.com/jazzl0ver/putty)"
+
 /*
  * Used by callback.c; declared up here so that prompts_t can use it
  */
@@ -1651,6 +1654,7 @@ struct TermWinVtable {
     void (*clip_write)(TermWin *, int clipboard, wchar_t *text, int *attrs,
                        truecolour *colours, int len, bool must_deselect);
     void (*clip_request_paste)(TermWin *, int clipboard);
+    bool (*open_url)(TermWin *, const char *url);
 
     void (*refresh)(TermWin *);
 
@@ -1735,6 +1739,8 @@ static inline void win_clip_write(
 { win->vt->clip_write(win, clipboard, text, attrs, colours, len, deselect); }
 static inline void win_clip_request_paste(TermWin *win, int clipboard)
 { win->vt->clip_request_paste(win, clipboard); }
+static inline bool win_open_url(TermWin *win, const char *url)
+{ return win->vt->open_url && win->vt->open_url(win, url); }
 static inline void win_refresh(TermWin *win)
 { win->vt->refresh(win); }
 static inline void win_request_resize(TermWin *win, int w, int h)
@@ -1979,6 +1985,7 @@ const struct BackendVtable *backend_vt_from_proto(int proto);
 char *get_remote_username(Conf *conf); /* dynamically allocated */
 char *save_settings(const char *section, Conf *conf);
 void save_open_settings(settings_w *sesskey, Conf *conf);
+void save_window_pos_settings(Conf *conf, int x, int y, int width, int height);
 bool load_settings(const char *section, Conf *conf);
 void load_open_settings(settings_r *sesskey, Conf *conf);
 void get_sesslist(struct sesslist *, bool allocate);
@@ -2023,6 +2030,8 @@ void term_pwron(Terminal *, bool);
 void term_clrsb(Terminal *);
 void term_mouse(Terminal *, Mouse_Button, Mouse_Button, Mouse_Action,
                 int, int, bool, bool, bool);
+bool term_open_url_at(Terminal *, int, int);
+bool term_update_url_hover_at(Terminal *, int, int);
 void term_cancel_selection_drag(Terminal *);
 void term_lost_clipboard_ownership(Terminal *, int clipboard);
 void term_update(Terminal *);

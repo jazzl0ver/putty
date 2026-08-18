@@ -747,7 +747,7 @@ void test_simple(void)
                         FUNKY_VT400, 3, FUNKY_VT100P, 4, FUNKY_SCO, 5,
                         FUNKY_XTERM_216, 6, -1);
     test_int_translated(CONF_sharrow_type, "ShiftedArrowKeys",
-                        SHARROW_APPLICATION,
+                        SHARROW_BITMAP,
                         SHARROW_APPLICATION, 0, SHARROW_BITMAP, 1, -1);
     test_bool_simple(CONF_no_applic_c, "NoApplicationCursors", false);
     test_bool_simple(CONF_no_applic_k, "NoApplicationKeys", false);
@@ -803,8 +803,11 @@ void test_simple(void)
     test_bool_simple(CONF_bce, "BCE", true);
     test_bool_simple(CONF_blinktext, "BlinkText", false);
     test_bool_simple(CONF_win_name_always, "WinNameAlways", true);
+    test_bool_simple(CONF_save_window_pos, "SaveWindowPos", true);
     test_int_simple(CONF_width, "TermWidth", 80);
     test_int_simple(CONF_height, "TermHeight", 24);
+    test_int_simple(CONF_window_xpos, "TermXPos", -1);
+    test_int_simple(CONF_window_ypos, "TermYPos", -1);
     test_font_simple(CONF_font, "Font");
     test_int_translated(CONF_font_quality, "FontQuality", FQ_DEFAULT,
                         FQ_DEFAULT, 0, FQ_ANTIALIASED, 1, FQ_NONANTIALIASED, 2,

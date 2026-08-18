@@ -90,6 +90,7 @@ static void term_userpass_state_free(struct term_userpass_state *s);
  */
 static void resizeline(Terminal *, termline *, int);
 static termline *lineptr(Terminal *, int, int);
+static int line_cols(Terminal *, termline *);
 static void check_line_size(Terminal *, termline *);
 static void do_paint(Terminal *);
 static void erase_lots(Terminal *, bool, bool, bool);
@@ -97,12 +98,19 @@ static int find_last_nonempty_line(Terminal *, tree234 *);
 static void swap_screen(Terminal *, int, bool, bool);
 static void update_sbar(Terminal *);
 static void deselect(Terminal *);
+static void clipme(Terminal *, pos, pos, bool, bool, const int *, int);
+static void term_out(Terminal *, bool);
+static void sel_spread(Terminal *);
 static void term_print_finish(Terminal *);
 static void scroll(Terminal *, int, int, int, bool);
 static void parse_optionalrgb(optionalrgb *out, unsigned *values);
 static void term_added_data(Terminal *term, bool);
 static void term_update_raw_mouse_mode(Terminal *term);
+static bool term_url_hover_contains(Terminal *term, pos p);
 static void term_out_cb(void *);
+static void format_forwarded_ports(strbuf *out, Conf *conf, bool dynamic);
+static char *format_window_title(Terminal *term, const char *pattern,
+                                 const char *title_hostname);
 
 static termline *newtermline(Terminal *term, int cols, bool bce)
 {
@@ -1765,7 +1773,7 @@ void term_reconfig(Terminal *term, Conf *conf)
         const char *new_title = conf_get_str(conf, CONF_wintitle);
         if (strcmp(old_title, new_title)) {
             sfree(term->window_title);
-            term->window_title = dupstr(new_title);
+            term->window_title = format_window_title(term, new_title, NULL);
             term->wintitle_codepage = DEFAULT_CODEPAGE;
             term->win_title_pending = true;
             term_schedule_update(term);
@@ -1900,8 +1908,9 @@ void term_setup_window_titles(Terminal *term, const char *title_hostname)
     sfree(term->window_title);
     sfree(term->icon_title);
     if (*conf_title) {
-        term->window_title = dupstr(conf_title);
-        term->icon_title = dupstr(conf_title);
+        term->window_title = format_window_title(
+            term, conf_title, title_hostname);
+        term->icon_title = dupstr(term->window_title);
     } else {
         if (title_hostname && *title_hostname)
             term->window_title = dupcat(title_hostname, " - ", appname);
@@ -1912,6 +1921,127 @@ void term_setup_window_titles(Terminal *term, const char *title_hostname)
     term->wintitle_codepage = term->icontitle_codepage = DEFAULT_CODEPAGE;
     term->win_title_pending = true;
     term->win_icon_title_pending = true;
+}
+
+static void format_forwarded_ports(strbuf *out, Conf *conf, bool dynamic)
+{
+    bool first = true;
+    char *key, *val;
+
+    for (val = conf_get_str_strs(conf, CONF_portfwd, NULL, &key);
+         val != NULL;
+         val = conf_get_str_strs(conf, CONF_portfwd, key, &key)) {
+        bool is_dynamic = !strcmp(val, "D");
+        const char *L = strchr(key, 'L');
+
+        if (!L || is_dynamic != dynamic)
+            continue;
+
+        if (!first)
+            put_datapl(out, PTRLEN_LITERAL(", "));
+        first = false;
+
+        if (dynamic) {
+            put_data(out, key, L - key);
+            put_byte(out, 'D');
+            put_dataz(out, L + 1);
+        } else {
+            put_dataz(out, key);
+        }
+    }
+}
+
+static char *format_window_title(
+    Terminal *term, const char *pattern, const char *title_hostname)
+{
+    strbuf *out = strbuf_new();
+    const BackendVtable *vt = backend_vt_from_proto(
+        conf_get_int(term->conf, CONF_protocol));
+    const char *hostname = conf_dest(term->conf);
+    const char *protocol = vt ? vt->displayname_lc : "";
+    const char *session_name = conf_get_str(term->conf, CONF_session_name);
+    const char *folder_name = "";
+    size_t folder_len = 0;
+    char portbuf[32];
+    char *username = get_remote_username(term->conf);
+    int port = conf_get_int(term->conf, CONF_port);
+
+    if (port <= 0 && vt)
+        port = vt->default_port;
+    snprintf(portbuf, sizeof(portbuf), "%d", port);
+
+    if ((!hostname || !*hostname) && title_hostname && *title_hostname)
+        hostname = title_hostname;
+
+    if (session_name && *session_name) {
+        const char *slash = strrchr(session_name, '/');
+        const char *bslash = strrchr(session_name, '\\');
+        const char *sep = (slash && (!bslash || slash > bslash)) ? slash : bslash;
+
+        if (sep && sep > session_name) {
+            folder_name = session_name;
+            folder_len = sep - session_name;
+        }
+    }
+
+    for (const char *p = pattern; *p; p++) {
+        if (*p != '%') {
+            put_byte(out, *p);
+            continue;
+        }
+
+        if (p[1] != '%') {
+            put_byte(out, '%');
+            continue;
+        }
+
+        p += 2;
+        if (!*p) {
+            put_byte(out, '%');
+            break;
+        }
+
+        switch (*p) {
+          case 'f':
+          case 'F':
+            if (folder_len)
+                put_data(out, folder_name, folder_len);
+            break;
+          case 'h':
+          case 'H':
+            put_dataz(out, hostname ? hostname : "");
+            break;
+          case 'p':
+            put_dataz(out, portbuf);
+            break;
+          case 'P':
+            put_dataz(out, protocol);
+            break;
+          case 's':
+          case 'S':
+            put_dataz(out, session_name ? session_name : "");
+            break;
+          case 'u':
+          case 'U':
+            put_dataz(out, username ? username : "");
+            break;
+          case 'l':
+          case 'L':
+            format_forwarded_ports(out, term->conf, false);
+            break;
+          case 'd':
+          case 'D':
+            format_forwarded_ports(out, term->conf, true);
+            break;
+          default:
+            put_byte(out, '%');
+            p--;
+            break;
+        }
+    }
+
+    sfree(username);
+    return strbuf_to_str(out);
 }
 
 static void palette_rebuild(Terminal *term)
@@ -3544,9 +3674,73 @@ static inline void term_bracketed_paste_stop(Terminal *term)
     term->bracketed_paste_active = false;
 }
 
+static bool term_input_is_return_key(const void *buf, int len)
+{
+    const char *str = (const char *)buf;
+
+    if (len < 0)
+        len = strlen(str);
+
+    return (len == 1 && (str[0] == '\r' || str[0] == '\n')) ||
+        (len == 2 && str[0] == '\r' && str[1] == '\n');
+}
+
+static bool term_extend_selection_to_bottom_on_return(
+    Terminal *term, const void *buf, int len, bool interactive)
+{
+    pos anchor, endpoint;
+
+    if (!interactive || !term_input_is_return_key(buf, len))
+        return false;
+    if (term->selstate != DRAGGING)
+        return false;
+    if (term->rows <= 0 || term->cols <= 0)
+        return false;
+
+    anchor = term->selstart;
+    endpoint.y = find_last_nonempty_line(term, term->screen);
+    if (endpoint.y < 0)
+        endpoint.y = term->rows - 1;
+    endpoint.x = term->cols - 1;
+
+    term->selstate = DRAGGING;
+    if (term->seltype == LEXICOGRAPHIC) {
+        if (poslt(endpoint, anchor)) {
+            term->selstart = endpoint;
+            term->selend = anchor;
+        } else {
+            term->selstart = anchor;
+            term->selend = endpoint;
+        }
+        incpos(term->selend);
+    } else {
+        term->selstart.x = min(anchor.x, endpoint.x);
+        term->selend.x = 1 + max(anchor.x, endpoint.x);
+        term->selstart.y = min(anchor.y, endpoint.y);
+        term->selend.y = max(anchor.y, endpoint.y);
+    }
+    sel_spread(term);
+
+    clipme(term, term->selstart, term->selend,
+           (term->seltype == RECTANGULAR), false,
+           term->mouse_select_clipboards,
+           term->n_mouse_select_clipboards);
+
+    term_bracketed_paste_stop(term);
+    term_nopaste(term);
+    term_scroll(term, -1, 0);
+    term_seen_key_event(term);
+    term_out(term, false);
+    term_schedule_update(term);
+    return true;
+}
+
 static inline void term_keyinput_internal(
     Terminal *term, const void *buf, int len, bool interactive)
 {
+    if (term_extend_selection_to_bottom_on_return(term, buf, len, interactive))
+        return;
+
     if (term->srm_echo) {
         /*
          * Implement the terminal-level local echo behaviour that
@@ -6201,6 +6395,9 @@ static void do_paint(Terminal *term)
             tattr = (tattr ^ rv
                      ^ (selected ? ATTR_REVERSE : 0));
 
+            if (term_url_hover_contains(term, scrpos))
+                tattr |= ATTR_UNDER;
+
             /* 'Real' blinking ? */
             if (term->blink_is_real && (tattr & ATTR_BLINK)) {
                 if (term->has_focus && term->tblinker) {
@@ -6859,6 +7056,358 @@ void term_request_paste(Terminal *term, int clipboard)
     }
 }
 
+typedef struct {
+    char *chars;
+    pos *positions;
+    size_t len, size;
+} url_scan_line;
+
+typedef struct {
+    size_t len;
+    bool add_https;
+} url_prefix_match;
+
+typedef struct {
+    char *url;
+    pos start;
+    pos end;
+} found_url;
+
+static void url_scan_add(url_scan_line *scan, char c, pos p)
+{
+    if (scan->len + 1 >= scan->size) {
+        scan->size = scan->size ? scan->size * 2 : 256;
+        scan->chars = sresize(scan->chars, scan->size, char);
+        scan->positions = sresize(scan->positions, scan->size, pos);
+    }
+    scan->chars[scan->len] = c;
+    scan->positions[scan->len] = p;
+    scan->len++;
+    scan->chars[scan->len] = '\0';
+}
+
+static void url_scan_free(url_scan_line *scan)
+{
+    sfree(scan->chars);
+    sfree(scan->positions);
+}
+
+static bool term_mouse_position(Terminal *term, int x, int y, pos *out)
+{
+    termline *ldata;
+    pos p;
+
+    if (x < 0 || x >= term->cols || y < 0 || y >= term->rows)
+        return false;
+
+    p.y = y + term->disptop;
+    ldata = lineptr(p.y);
+
+    if ((ldata->lattr & LATTR_MODE) != LATTR_NORM)
+        x /= 2;
+
+    if (term_bidi_line(term, ldata, y) != NULL)
+        x = term->post_bidi_cache[y].backward[x];
+
+    p.x = x;
+    unlineptr(ldata);
+
+    *out = p;
+    return true;
+}
+
+static char termchar_url_char(Terminal *term, termline *ldata, int x)
+{
+    unsigned long uc = ldata->chars[x].chr;
+
+    if (uc == UCSWIDE || uc == TRUST_SIGIL_CHAR)
+        return ' ';
+
+    switch (uc & CSET_MASK) {
+      case CSET_LINEDRW:
+        if (!term->rawcnp) {
+            uc = term->ucsdata->unitab_xterm[uc & 0xFF];
+            break;
+        }
+      case CSET_ASCII:
+        uc = term->ucsdata->unitab_line[uc & 0xFF];
+        break;
+      case CSET_SCOACS:
+        uc = term->ucsdata->unitab_scoacs[uc & 0xFF];
+        break;
+    }
+    switch (uc & CSET_MASK) {
+      case CSET_ACP:
+        uc = term->ucsdata->unitab_font[uc & 0xFF];
+        break;
+      case CSET_OEMCP:
+        uc = term->ucsdata->unitab_oemcp[uc & 0xFF];
+        break;
+    }
+
+    if (DIRECT_CHAR(uc) || DIRECT_FONT(uc))
+        uc &= ~CSET_MASK;
+
+    return (uc >= 0x21 && uc <= 0x7E) ? (char)uc : ' ';
+}
+
+static bool collect_url_scan_line(
+    Terminal *term, pos click, url_scan_line *scan, size_t *click_index)
+{
+    int start_y = click.y, end_y = click.y;
+    int top_y = -sblines(term), bottom_y = term->disptop + term->rows - 1;
+    bool found_click = false;
+
+    memset(scan, 0, sizeof(*scan));
+
+    while (start_y > top_y) {
+        termline *prev = lineptr(start_y - 1);
+        bool wrapped = (prev->lattr & LATTR_WRAPPED) != 0;
+        unlineptr(prev);
+        if (!wrapped)
+            break;
+        start_y--;
+    }
+
+    while (end_y < bottom_y) {
+        termline *line = lineptr(end_y);
+        bool wrapped = (line->lattr & LATTR_WRAPPED) != 0;
+        unlineptr(line);
+        if (!wrapped)
+            break;
+        end_y++;
+    }
+
+    for (int y = start_y; y <= end_y; y++) {
+        termline *line = lineptr(y);
+        int cols = line_cols(term, line);
+
+        for (int x = 0; x < cols; x++) {
+            pos here;
+            here.y = y;
+            here.x = x;
+            if (poseq(here, click)) {
+                *click_index = scan->len;
+                found_click = true;
+            }
+            url_scan_add(scan, termchar_url_char(term, line, x), here);
+        }
+
+        unlineptr(line);
+    }
+
+    return found_click;
+}
+
+static bool url_startswith(const char *s, size_t len, size_t pos,
+                           const char *prefix)
+{
+    for (size_t i = 0; prefix[i]; i++) {
+        if (pos + i >= len)
+            return false;
+        if (tolower((unsigned char)s[pos + i]) != prefix[i])
+            return false;
+    }
+    return true;
+}
+
+static url_prefix_match url_prefix_at(const char *s, size_t len, size_t pos)
+{
+    url_prefix_match match = { 0, false };
+
+    if (url_startswith(s, len, pos, "https://"))
+        match.len = 8;
+    if (url_startswith(s, len, pos, "http://"))
+        match.len = 7;
+    if (url_startswith(s, len, pos, "www.")) {
+        match.len = 4;
+        match.add_https = true;
+    }
+
+    return match;
+}
+
+static bool url_body_char(char c)
+{
+    switch (c) {
+      case '\"':
+      case '\'':
+      case '`':
+      case '<':
+      case '>':
+      case '\\':
+        return false;
+      default:
+        return c > ' ' && c < 0x7F;
+    }
+}
+
+static bool url_closing_punct_unmatched(
+    const char *s, size_t start, size_t end, char opener, char closer)
+{
+    int balance = 0;
+
+    for (size_t i = start; i + 1 < end; i++) {
+        if (s[i] == opener) {
+            balance++;
+        } else if (s[i] == closer && balance > 0) {
+            balance--;
+        }
+    }
+
+    return balance == 0;
+}
+
+static size_t url_trim_end(const char *s, size_t start, size_t end)
+{
+    while (end > start) {
+        switch (s[end - 1]) {
+          case '.':
+          case ',':
+          case ';':
+          case ':':
+          case '!':
+          case '?':
+            end--;
+            break;
+          case ')':
+            if (url_closing_punct_unmatched(s, start, end, '(', ')'))
+                end--;
+            else
+                return end;
+            break;
+          case ']':
+            if (url_closing_punct_unmatched(s, start, end, '[', ']'))
+                end--;
+            else
+                return end;
+            break;
+          case '}':
+            if (url_closing_punct_unmatched(s, start, end, '{', '}'))
+                end--;
+            else
+                return end;
+            break;
+          default:
+            return end;
+        }
+    }
+
+    return end;
+}
+
+static bool term_find_url_at_pos(Terminal *term, pos click, found_url *found)
+{
+    url_scan_line scan;
+    size_t click_index = 0;
+
+    memset(found, 0, sizeof(*found));
+
+    if (!collect_url_scan_line(term, click, &scan, &click_index)) {
+        url_scan_free(&scan);
+        return false;
+    }
+
+    for (size_t start = 0; start < scan.len; start++) {
+        url_prefix_match prefix = url_prefix_at(scan.chars, scan.len, start);
+        size_t end, trimmed_end, url_len;
+        size_t extra_len;
+
+        if (!prefix.len)
+            continue;
+
+        end = start + prefix.len;
+        while (end < scan.len && url_body_char(scan.chars[end]))
+            end++;
+
+        trimmed_end = url_trim_end(scan.chars, start, end);
+        if (trimmed_end <= start + prefix.len)
+            continue;
+
+        if (click_index < start || click_index >= trimmed_end)
+            continue;
+
+        url_len = trimmed_end - start;
+        extra_len = prefix.add_https ? strlen("https://") : 0;
+        found->url = snewn(extra_len + url_len + 1, char);
+        if (prefix.add_https)
+            memcpy(found->url, "https://", extra_len);
+        memcpy(found->url + extra_len, scan.chars + start, url_len);
+        found->url[extra_len + url_len] = '\0';
+        found->start = scan.positions[start];
+        found->end = scan.positions[trimmed_end - 1];
+        incpos(found->end);
+        break;
+    }
+
+    url_scan_free(&scan);
+    return found->url != NULL;
+}
+
+static void term_set_url_hover(
+    Terminal *term, bool active, pos start, pos end)
+{
+    if (term->url_hover_active == active &&
+        (!active ||
+         (poseq(term->url_hover_start, start) &&
+          poseq(term->url_hover_end, end))))
+        return;
+
+    term->url_hover_active = active;
+    if (active) {
+        term->url_hover_start = start;
+        term->url_hover_end = end;
+    }
+
+    term_schedule_update(term);
+}
+
+static bool term_url_hover_contains(Terminal *term, pos p)
+{
+    return term->url_hover_active &&
+        posle(term->url_hover_start, p) && poslt(p, term->url_hover_end);
+}
+
+bool term_update_url_hover_at(Terminal *term, int x, int y)
+{
+    pos hover = { 0, 0 };
+    found_url found;
+
+    if (!term_mouse_position(term, x, y, &hover)) {
+        term_set_url_hover(term, false, hover, hover);
+        return false;
+    }
+
+    if (term_find_url_at_pos(term, hover, &found)) {
+        term_set_url_hover(term, true, found.start, found.end);
+        sfree(found.url);
+        return true;
+    }
+
+    term_set_url_hover(term, false, hover, hover);
+    return false;
+}
+
+bool term_open_url_at(Terminal *term, int x, int y)
+{
+    pos click;
+    found_url found;
+    bool opened;
+
+    if (!term->win || !term->win->vt->open_url)
+        return false;
+
+    if (!term_mouse_position(term, x, y, &click))
+        return false;
+
+    if (!term_find_url_at_pos(term, click, &found))
+        return false;
+
+    opened = win_open_url(term->win, found.url);
+    sfree(found.url);
+    return opened;
+}
+
 /*
  * The wordness array is mainly for deciding the disposition of the
  * US-ASCII characters.
@@ -7503,8 +8052,9 @@ void term_mouse(Terminal *term, Mouse_Button braw, Mouse_Button bcooked,
                    term->mouse_select_clipboards,
                    term->n_mouse_select_clipboards);
             term->selstate = SELECTED;
-        } else
+        } else {
             term->selstate = NO_SELECTION;
+        }
     } else if (bcooked == MBT_PASTE
                && (a == MA_CLICK
 #if MULTICLICK_ONLY_EVENT
@@ -7588,10 +8138,10 @@ int format_arrow_key(char *buf, Terminal *term, int xkey,
             break;
         }
 
-        if (app_flg)
-            p += sprintf(p, "\x1BO%c", xkey);
-        else if (bitmap)
+        if (bitmap)
             p += sprintf(p, "\x1B[1;%d%c", bitmap, xkey);
+        else if (app_flg)
+            p += sprintf(p, "\x1BO%c", xkey);
         else
             p += sprintf(p, "\x1B[%c", xkey);
     }

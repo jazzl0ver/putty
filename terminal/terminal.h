@@ -226,6 +226,8 @@ struct terminal_tag {
         SM_CHAR, SM_WORD, SM_LINE
     } selmode;
     pos selstart, selend, selanchor;
+    bool url_hover_active;
+    pos url_hover_start, url_hover_end;
 
     short wordness[256];
 

@@ -17,6 +17,7 @@
 #include "ssh.h"
 #include "terminal.h"
 #include "storage.h"
+#include "filestore.h"
 #include "putty-rc.h"
 #include "security-api.h"
 #include "win-gui-seat.h"
@@ -30,6 +31,7 @@
 #include <commctrl.h>
 #include <richedit.h>
 #include <mmsystem.h>
+#include <shellapi.h>
 
 /* From MSDN: In the WM_SYSCOMMAND message, the four low-order bits of
  * wParam are used by Windows, and should be masked off, so we shouldn't
@@ -40,9 +42,11 @@
 #define IDM_NEWSESS   0x0020
 #define IDM_DUPSESS   0x0030
 #define IDM_RESTART   0x0040
+#define IDM_CLOSERESTART 0x0080
 #define IDM_RECONF    0x0050
 #define IDM_CLRSB     0x0060
 #define IDM_RESET     0x0070
+#define IDM_WINSCP    0x0090
 #define IDM_HELP      0x0140
 #define IDM_ABOUT     0x0150
 #define IDM_SAVEDSESS 0x0160
@@ -50,6 +54,7 @@
 #define IDM_FULLSCREEN  0x0180
 #define IDM_COPY      0x0190
 #define IDM_PASTE     0x01A0
+#define IDM_MINIMIZE_TO_TRAY PUTTY_SYSCOMMAND_MINIMIZE_TO_TRAY
 #define IDM_SPECIALSEP 0x0200
 
 #define IDM_SPECIAL_MIN 0x0400
@@ -93,6 +98,9 @@
 #ifndef VK_PACKET
 #define VK_PACKET 0xE7
 #endif
+#ifndef IDC_HAND
+#define IDC_HAND MAKEINTRESOURCE(32649)
+#endif
 
 static Mouse_Button translate_button(WinGuiSeat *wgs, Mouse_Button button);
 static void show_mouseptr(WinGuiSeat *wgs, bool show);
@@ -104,8 +112,10 @@ static void init_fonts(WinGuiSeat *wgs, int, int);
 static void init_dpi_info(WinGuiSeat *wgs);
 static void another_font(WinGuiSeat *wgs, int);
 static void deinit_fonts(WinGuiSeat *wgs);
+static void change_font_size(WinGuiSeat *wgs, int increment);
 static void set_input_locale(WinGuiSeat *wgs, HKL);
 static void update_savedsess_menu(WinGuiSeat *wgs);
+static void start_winscp(WinGuiSeat *wgs);
 static void init_winfuncs(void);
 
 static bool is_full_screen(WinGuiSeat *wgs);
@@ -117,6 +127,9 @@ static void setup_clipboards(Terminal *, Conf *);
 
 /* Window layout information */
 static void reset_window(WinGuiSeat *wgs, int reinit);
+static void save_window_pos_from_hwnd(WinGuiSeat *wgs);
+static bool send_minimize_to_launcher(WinGuiSeat *wgs, HWND hwnd);
+static bool minimize_to_launcher(WinGuiSeat *wgs, HWND hwnd);
 
 static void flash_window(WinGuiSeat *wgs, int mode);
 static void sys_cursor_update(WinGuiSeat *wgs);
@@ -164,6 +177,7 @@ static void wintw_clip_write(
     TermWin *, int clipboard, wchar_t *text, int *attrs,
     truecolour *colours, int len, bool must_deselect);
 static void wintw_clip_request_paste(TermWin *, int clipboard);
+static bool wintw_open_url(TermWin *, const char *url);
 static void wintw_refresh(TermWin *);
 static void wintw_request_resize(TermWin *, int w, int h);
 static void wintw_set_title(TermWin *, const char *title, int codepage);
@@ -191,6 +205,7 @@ static const TermWinVtable windows_termwin_vt = {
     .bell = wintw_bell,
     .clip_write = wintw_clip_write,
     .clip_request_paste = wintw_clip_request_paste,
+    .open_url = wintw_open_url,
     .refresh = wintw_refresh,
     .request_resize = wintw_request_resize,
     .set_title = wintw_set_title,
@@ -336,7 +351,154 @@ static void start_backend(WinGuiSeat *wgs)
         DeleteMenu(wgs->popup_menus[i].menu, IDM_RESTART, MF_BYCOMMAND);
     }
 
+    /* Ensure the Close+Restart menu item is present while active. */
+    for (i = 0; i < lenof(wgs->popup_menus); i++) {
+        DeleteMenu(wgs->popup_menus[i].menu, IDM_CLOSERESTART, MF_BYCOMMAND);
+        InsertMenu(wgs->popup_menus[i].menu, IDM_DUPSESS,
+                   MF_BYCOMMAND | MF_ENABLED, IDM_CLOSERESTART,
+                   "Close+&Restart");
+    }
+
     wgs->session_closed = false;
+    wgs->pending_restart = false;
+}
+
+static void append_windows_command_line_arg(strbuf *cmdline, const char *arg)
+{
+    const char *p = arg;
+    size_t backslashes = 0;
+
+    if (cmdline->len)
+        put_byte(cmdline, ' ');
+    put_byte(cmdline, '"');
+
+    while (*p) {
+        if (*p == '\\') {
+            backslashes++;
+        } else {
+            size_t i, count = backslashes;
+
+            if (*p == '"')
+                count = 2 * backslashes + 1;
+            for (i = 0; i < count; i++)
+                put_byte(cmdline, '\\');
+            backslashes = 0;
+            put_byte(cmdline, *p);
+        }
+        p++;
+    }
+
+    while (backslashes) {
+        put_data(cmdline, "\\\\", 2);
+        backslashes--;
+    }
+    put_byte(cmdline, '"');
+}
+
+static void start_winscp(WinGuiSeat *wgs)
+{
+    const char *host = conf_get_str(wgs->conf, CONF_host);
+    const char *username = conf_get_str_ambi(wgs->conf, CONF_username, NULL);
+    Filename *keyfile = conf_get_filename(wgs->conf, CONF_keyfile);
+    strbuf *url = strbuf_new(), *params = strbuf_new();
+    char *option;
+    wchar_t *wparams;
+    Filename *configured_winscp =
+        conf_get_filename(wgs->conf, CONF_winscp_path);
+    Filename *global_winscp = NULL;
+    wchar_t winscp_path[32768], *last_separator;
+    const wchar_t *application = L"WinSCP.exe";
+    HINSTANCE result;
+    DWORD length;
+
+    if (conf_get_int(wgs->conf, CONF_protocol) != PROT_SSH || !*host) {
+        MessageBox(wgs->term_hwnd,
+                   "Start WinSCP is available only for SSH sessions.",
+                   appname, MB_OK | MB_ICONINFORMATION);
+        goto out;
+    }
+
+    put_dataz(url, "sftp://");
+    if (strchr(host, ':'))
+        put_fmt(url, "[%s]", host);
+    else
+        put_dataz(url, host);
+    put_fmt(url, ":%d/", conf_get_int(wgs->conf, CONF_port));
+    append_windows_command_line_arg(params, url->s);
+
+    if (*username) {
+        option = dupprintf("/username=%s", username);
+        append_windows_command_line_arg(params, option);
+        sfree(option);
+    }
+
+    if (keyfile && keyfile->utf8path[0]) {
+        option = dupprintf("/privatekey=%s", keyfile->utf8path);
+        append_windows_command_line_arg(params, option);
+        sfree(option);
+    }
+
+    wparams = dup_mb_to_wc(CP_UTF8, params->s);
+
+    if (!configured_winscp->wpath[0]) {
+        global_winscp = win_load_winscp_path();
+        configured_winscp = global_winscp;
+    }
+
+    if (configured_winscp->wpath[0]) {
+        application = configured_winscp->wpath;
+    } else {
+        length = GetModuleFileNameW(NULL, winscp_path, lenof(winscp_path));
+        if (length > 0 && length < lenof(winscp_path)) {
+            last_separator = wcsrchr(winscp_path, L'\\');
+            if (last_separator &&
+                last_separator - winscp_path + 11 < lenof(winscp_path)) {
+                memcpy(last_separator + 1, L"WinSCP.exe",
+                       11 * sizeof(wchar_t));
+                if (GetFileAttributesW(winscp_path) != INVALID_FILE_ATTRIBUTES)
+                    application = winscp_path;
+            }
+        }
+    }
+
+    result = ShellExecuteW(wgs->term_hwnd, L"open", application, wparams,
+                           NULL, SW_SHOWNORMAL);
+
+    if ((INT_PTR)result <= 32) {
+        OPENFILENAMEW of = { 0 };
+
+        wcscpy(winscp_path, L"WinSCP.exe");
+        of.lStructSize = sizeof(of);
+        of.hwndOwner = wgs->term_hwnd;
+        of.lpstrFilter =
+            L"WinSCP executable (WinSCP.exe)\0WinSCP.exe\0"
+            L"Executables (*.exe)\0*.exe\0All files\0*.*\0\0";
+        of.lpstrFile = winscp_path;
+        of.nMaxFile = lenof(winscp_path);
+        of.lpstrTitle = L"Locate WinSCP.exe";
+        of.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+        if (GetOpenFileNameW(&of)) {
+            Filename *selected = filename_from_wstr(winscp_path);
+            conf_set_filename(wgs->conf, CONF_winscp_path, selected);
+            win_save_winscp_path(selected);
+            filename_free(selected);
+
+            result = ShellExecuteW(wgs->term_hwnd, L"open", winscp_path,
+                                   wparams, NULL, SW_SHOWNORMAL);
+            if ((INT_PTR)result <= 32)
+                MessageBox(wgs->term_hwnd,
+                           "Unable to start the selected WinSCP executable.",
+                           appname, MB_OK | MB_ICONERROR);
+        }
+    }
+    sfree(wparams);
+
+  out:
+    if (global_winscp)
+        filename_free(global_winscp);
+    strbuf_free(params);
+    strbuf_free(url);
 }
 
 static void close_session(void *vctx)
@@ -367,9 +529,15 @@ static void close_session(void *vctx)
      * delete first to ensure we never end up with more than one.
      */
     for (i = 0; i < lenof(wgs->popup_menus); i++) {
+        DeleteMenu(wgs->popup_menus[i].menu, IDM_CLOSERESTART, MF_BYCOMMAND);
         DeleteMenu(wgs->popup_menus[i].menu, IDM_RESTART, MF_BYCOMMAND);
         InsertMenu(wgs->popup_menus[i].menu, IDM_DUPSESS,
                    MF_BYCOMMAND | MF_ENABLED, IDM_RESTART, "&Restart Session");
+    }
+
+    if (wgs->pending_restart) {
+        wgs->pending_restart = false;
+        PostMessage(wgs->term_hwnd, WM_COMMAND, IDM_RESTART, 0);
     }
 }
 
@@ -546,6 +714,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     {
         int winmode = WS_OVERLAPPEDWINDOW | WS_VSCROLL;
         int exwinmode = 0;
+        int initial_x = CW_USEDEFAULT, initial_y = CW_USEDEFAULT;
         const struct BackendVtable *vt =
             backend_vt_from_proto(be_default_protocol);
         bool resize_forbidden = false;
@@ -563,6 +732,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
             exwinmode |= WS_EX_TOPMOST;
         if (conf_get_bool(wgs->conf, CONF_sunken_edge))
             exwinmode |= WS_EX_CLIENTEDGE;
+        if (conf_get_int(wgs->conf, CONF_window_xpos) != -1 &&
+            conf_get_int(wgs->conf, CONF_window_ypos) != -1) {
+            initial_x = conf_get_int(wgs->conf, CONF_window_xpos);
+            initial_y = conf_get_int(wgs->conf, CONF_window_ypos);
+        }
 
 #ifdef TEST_ANSI_WINDOW
         /* For developer testing of ANSI window support, pretend
@@ -576,7 +750,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
         sw_DefWindowProc = DefWindowProcW;
         wgs->term_hwnd = CreateWindowExW(
             exwinmode, terminal_window_class_w(), uappname,
-            winmode, CW_USEDEFAULT, CW_USEDEFAULT,
+            winmode, initial_x, initial_y,
             guess_width, guess_height, NULL, NULL, inst, NULL);
 #endif
 
@@ -590,7 +764,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
             sw_DefWindowProc = DefWindowProcA;
             wgs->term_hwnd = CreateWindowExA(
                 exwinmode, terminal_window_class_a(), appname,
-                winmode, CW_USEDEFAULT, CW_USEDEFAULT,
+                winmode, initial_x, initial_y,
                 guess_width, guess_height, NULL, NULL, inst, NULL);
         }
 #endif
@@ -741,8 +915,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
         wgs->popup_menus[SYSMENU].menu = GetSystemMenu(wgs->term_hwnd, false);
         wgs->popup_menus[CTXMENU].menu = CreatePopupMenu();
 
+        InsertMenu(wgs->popup_menus[SYSMENU].menu, SC_MAXIMIZE,
+                   MF_BYCOMMAND | MF_ENABLED, IDM_MINIMIZE_TO_TRAY,
+                   "Minimize to &Tray");
+
         for (j = 0; j < lenof(wgs->popup_menus); j++) {
             m = wgs->popup_menus[j].menu;
+            if (j == CTXMENU) {
+                AppendMenu(m, MF_ENABLED, IDM_MINIMIZE_TO_TRAY,
+                           "Minimize to &Tray");
+                AppendMenu(m, MF_SEPARATOR, 0, 0);
+            }
             AppendMenu(m, MF_ENABLED, IDM_COPY, "&Copy");
             AppendMenu(m, MF_ENABLED, IDM_PASTE, "&Paste");
         }
@@ -762,6 +945,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
             AppendMenu(m, MF_POPUP | MF_ENABLED, (UINT_PTR)wgs->savedsess_menu,
                        "Sa&ved Sessions");
             AppendMenu(m, MF_ENABLED, IDM_RECONF, "Chan&ge Settings...");
+            AppendMenu(m,
+                       (conf_get_int(wgs->conf, CONF_protocol) == PROT_SSH &&
+                        conf_get_str(wgs->conf, CONF_host)[0]) ?
+                       MF_ENABLED : MF_GRAYED,
+                       IDM_WINSCP, "Start &WinSCP");
             AppendMenu(m, MF_SEPARATOR, 0, 0);
             AppendMenu(m, MF_ENABLED, IDM_COPYALL, "C&opy All to Clipboard");
             AppendMenu(m, MF_ENABLED, IDM_CLRSB, "C&lear Scrollback");
@@ -1119,7 +1307,9 @@ static void update_mouse_pointer(WinGuiSeat *wgs)
     static bool forced_visible = false;
     switch (wgs->busy_status) {
       case BUSY_NOT:
-        if (wgs->pointer_indicates_raw_mouse)
+        if (wgs->pointer_indicates_url)
+            curstype = IDC_HAND;
+        else if (wgs->pointer_indicates_raw_mouse)
             curstype = IDC_ARROW;
         else
             curstype = IDC_IBEAM;
@@ -1167,6 +1357,15 @@ static void wintw_set_raw_mouse_mode_pointer(TermWin *tw, bool activate)
 {
     WinGuiSeat *wgs = container_of(tw, WinGuiSeat, termwin);
     wgs->pointer_indicates_raw_mouse = activate;
+    update_mouse_pointer(wgs);
+}
+
+static void win_set_url_pointer(WinGuiSeat *wgs, bool active)
+{
+    if (wgs->pointer_indicates_url == active)
+        return;
+
+    wgs->pointer_indicates_url = active;
     update_mouse_pointer(wgs);
 }
 
@@ -1693,6 +1892,27 @@ static void deinit_fonts(WinGuiSeat *wgs)
     trust_icon = INVALID_HANDLE_VALUE;
 }
 
+static void change_font_size(WinGuiSeat *wgs, int increment)
+{
+    FontSpec *font = conf_get_fontspec(wgs->conf, CONF_font);
+    int newheight = font->height + increment;
+
+    if (newheight < 1)
+        return;
+
+    if (newheight != font->height) {
+        FontSpec *newfont = fontspec_new(
+            font->name, font->isbold, newheight, font->charset);
+        conf_set_fontspec(wgs->conf, CONF_font, newfont);
+        fontspec_free(newfont);
+    }
+
+    term_size(wgs->term, conf_get_int(wgs->conf, CONF_height),
+              conf_get_int(wgs->conf, CONF_width),
+              conf_get_int(wgs->conf, CONF_savelines));
+    reset_window(wgs, 2);
+}
+
 static void wintw_request_resize(TermWin *tw, int w, int h)
 {
     WinGuiSeat *wgs = container_of(tw, WinGuiSeat, termwin);
@@ -2110,6 +2330,7 @@ static void exit_callback(void *vctx)
          * appropriate action. */
         if (close_on_exit == FORCE_ON ||
             (close_on_exit == AUTO && exitcode != INT_MAX)) {
+            save_window_pos_from_hwnd(wgs);
             PostQuitMessage(0);
         } else {
             queue_toplevel_callback(close_session, wgs);
@@ -2194,6 +2415,105 @@ static void wm_size_resize_term(WinGuiSeat *wgs, LPARAM lParam)
     conf_set_int(wgs->conf, CONF_width, w);
 }
 
+static void save_window_pos_from_hwnd(WinGuiSeat *wgs)
+{
+    RECT r;
+    WINDOWPLACEMENT wp;
+
+    wp.length = sizeof(wp);
+    if ((IsIconic(wgs->term_hwnd) || IsZoomed(wgs->term_hwnd)) &&
+        GetWindowPlacement(wgs->term_hwnd, &wp))
+        r = wp.rcNormalPosition;
+    else if (!GetWindowRect(wgs->term_hwnd, &r))
+        return;
+
+    save_window_pos_settings(
+        wgs->conf, r.left, r.top,
+        conf_get_int(wgs->conf, CONF_width),
+        conf_get_int(wgs->conf, CONF_height));
+}
+
+static bool send_minimize_to_launcher(WinGuiSeat *wgs, HWND hwnd)
+{
+    HWND launcher;
+    const wchar_t *title, *wide_session_name;
+    wchar_t *allocated_session_name = NULL;
+    char *session_name;
+    size_t header_bytes, title_chars, session_name_chars;
+    size_t payload_chars, payload_bytes;
+    PuttyLauncherMinimizedSessionCopyData *payload;
+    COPYDATASTRUCT cds;
+    DWORD_PTR reply = 0;
+    BOOL sent;
+
+    if (!wgs)
+        return false;
+
+    launcher = FindWindowW(PUTTY_LAUNCHER_WNDCLASS, NULL);
+    if (!launcher)
+        return false;
+
+    title = wgs->window_name ? wgs->window_name : L"PuTTY";
+    session_name = conf_get_str(wgs->conf, CONF_session_name);
+    if (session_name && *session_name)
+        allocated_session_name = dup_mb_to_wc(CP_UTF8, session_name);
+    wide_session_name = allocated_session_name ? allocated_session_name : L"";
+
+    title_chars = wcslen(title);
+    session_name_chars = wcslen(wide_session_name);
+    header_bytes = offsetof(PuttyLauncherMinimizedSessionCopyData, strings);
+    if (title_chars > (size_t)-1 - 2 ||
+        session_name_chars > (size_t)-1 - title_chars - 2) {
+        sfree(allocated_session_name);
+        return false;
+    }
+    payload_chars = title_chars + 1 + session_name_chars + 1;
+    if (payload_chars > ((size_t)-1 - header_bytes) / sizeof(wchar_t)) {
+        sfree(allocated_session_name);
+        return false;
+    }
+    payload_bytes = header_bytes + payload_chars * sizeof(wchar_t);
+
+    if (title_chars > MAXDWORD || session_name_chars > MAXDWORD ||
+        payload_bytes > MAXDWORD) {
+        sfree(allocated_session_name);
+        return false;
+    }
+
+    payload = (PuttyLauncherMinimizedSessionCopyData *)
+        snewn(payload_bytes, unsigned char);
+    payload->hwnd = hwnd;
+    payload->title_chars = (DWORD)title_chars;
+    payload->session_name_chars = (DWORD)session_name_chars;
+    wcscpy(payload->strings, title);
+    wcscpy(payload->strings + title_chars + 1, wide_session_name);
+
+    cds.dwData = PUTTY_LAUNCHER_COPYDATA_MINIMIZED_SESSION;
+    cds.cbData = (DWORD)payload_bytes;
+    cds.lpData = payload;
+
+    sent = SendMessageTimeoutW(launcher, WM_COPYDATA, (WPARAM)hwnd,
+                               (LPARAM)&cds, SMTO_ABORTIFHUNG, 1000, &reply);
+
+    sfree(payload);
+    sfree(allocated_session_name);
+    return sent && reply;
+}
+
+static bool minimize_to_launcher(WinGuiSeat *wgs, HWND hwnd)
+{
+    if (!send_minimize_to_launcher(wgs, hwnd))
+        return false;
+
+    wgs->hidden_to_launcher = true;
+    term_notify_minimised(wgs->term, true);
+    sw_SetWindowText(hwnd,
+                     conf_get_bool(wgs->conf, CONF_win_name_always) ?
+                     wgs->window_name : wgs->icon_name);
+    ShowWindow(hwnd, SW_HIDE);
+    return true;
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                                 WPARAM wParam, LPARAM lParam)
 {
@@ -2203,6 +2523,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
 
     switch (message) {
       case WM_CREATE:
+        break;
+      case WM_SHOWWINDOW:
+        if (wParam && wgs && wgs->hidden_to_launcher) {
+            wgs->hidden_to_launcher = false;
+            term_notify_minimised(wgs->term, false);
+            sw_SetWindowText(hwnd, wgs->window_name);
+        }
         break;
       case WM_CLOSE: {
         char *title, *msg, *additional = NULL;
@@ -2227,6 +2554,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
       }
       case WM_DESTROY:
         show_mouseptr(wgs, true);
+        save_window_pos_from_hwnd(wgs);
         PostQuitMessage(0);
         return 0;
       case WM_INITMENUPOPUP:
@@ -2260,6 +2588,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             break;
           case IDM_SHOWLOG:
             showeventlog(hwnd);
+            break;
+          case IDM_WINSCP:
+            start_winscp(wgs);
             break;
           case IDM_NEWSESS:
           case IDM_DUPSESS:
@@ -2351,6 +2682,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                 start_backend(wgs);
             }
 
+            break;
+          case IDM_CLOSERESTART:
+            if (wgs->backend) {
+                wgs->pending_restart = true;
+                queue_toplevel_callback(close_session, wgs);
+            } else {
+                PostMessage(hwnd, WM_COMMAND, IDM_RESTART, 0);
+            }
             break;
           case IDM_RECONF: {
             Conf *prev_conf;
@@ -2531,6 +2870,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             conf_free(prev_conf);
             break;
           }
+          case IDM_MINIMIZE_TO_TRAY:
+            if (!minimize_to_launcher(wgs, hwnd))
+                ShowWindow(hwnd, SW_MINIMIZE);
+            break;
           case IDM_COPYALL:
             term_copyall(wgs->term, clips_system, lenof(clips_system));
             break;
@@ -2707,15 +3050,38 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             }
 
             if (press) {
-                click(wgs, button,
-                      TO_CHR_X(X_POS(lParam)), TO_CHR_Y(Y_POS(lParam)),
+                int x = TO_CHR_X(X_POS(lParam));
+                int y = TO_CHR_Y(Y_POS(lParam));
+
+                if (button == MBT_LEFT && (wParam & MK_CONTROL) &&
+                    (wParam & MK_SHIFT)) {
+                    wgs->url_click_pending = true;
+                    wgs->lastbtn = MBT_NOTHING;
+                    SetCapture(hwnd);
+                    return 0;
+                }
+
+                click(wgs, button, x, y,
                       wParam & MK_SHIFT, wParam & MK_CONTROL,
                       is_alt_pressed());
                 SetCapture(hwnd);
             } else {
+                int x = TO_CHR_X(X_POS(lParam));
+                int y = TO_CHR_Y(Y_POS(lParam));
+
+                if (button == MBT_LEFT && wgs->url_click_pending) {
+                    wgs->url_click_pending = false;
+                    if ((wParam & MK_CONTROL) && (wParam & MK_SHIFT))
+                        term_open_url_at(wgs->term, x, y);
+                    win_set_url_pointer(
+                        wgs, term_update_url_hover_at(wgs->term, x, y));
+                    if (!(wParam & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON)))
+                        ReleaseCapture();
+                    return 0;
+                }
+
                 term_mouse(wgs->term, button, translate_button(wgs, button),
-                           MA_RELEASE, TO_CHR_X(X_POS(lParam)),
-                           TO_CHR_Y(Y_POS(lParam)), wParam & MK_SHIFT,
+                           MA_RELEASE, x, y, wParam & MK_SHIFT,
                            wParam & MK_CONTROL, is_alt_pressed());
                 if (!(wParam & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON)))
                     ReleaseCapture();
@@ -2744,6 +3110,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
 
         if (wParam & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON) &&
             GetCapture() == hwnd) {
+            int x = TO_CHR_X(X_POS(lParam));
+            int y = TO_CHR_Y(Y_POS(lParam));
+
+            if (wgs->url_click_pending)
+                return 0;
+
             Mouse_Button b;
             if (wParam & MK_LBUTTON)
                 b = MBT_LEFT;
@@ -2752,17 +3124,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
             else
                 b = MBT_RIGHT;
             term_mouse(wgs->term, b, translate_button(wgs, b), MA_DRAG,
-                       TO_CHR_X(X_POS(lParam)),
-                       TO_CHR_Y(Y_POS(lParam)), wParam & MK_SHIFT,
-                       wParam & MK_CONTROL, is_alt_pressed());
+                       x, y, wParam & MK_SHIFT, wParam & MK_CONTROL,
+                       is_alt_pressed());
         } else {
+            int x = TO_CHR_X(X_POS(lParam));
+            int y = TO_CHR_Y(Y_POS(lParam));
+            win_set_url_pointer(
+                wgs, term_update_url_hover_at(wgs->term, x, y));
             term_mouse(wgs->term, MBT_NOTHING, MBT_NOTHING, MA_MOVE,
-                       TO_CHR_X(X_POS(lParam)),
-                       TO_CHR_Y(Y_POS(lParam)), false,
-                       false, false);
+                       x, y, false, false, false);
         }
         return 0;
       case WM_NCMOUSEMOVE:
+        win_set_url_pointer(wgs, false);
+        term_update_url_hover_at(wgs->term, -1, -1);
         if (wgs->last_mousemove != WM_NCMOUSEMOVE ||
             wParam != wgs->last_wm_ncmousemove_wParam ||
             lParam != wgs->last_wm_ncmousemove_lParam) {
@@ -3016,6 +3391,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
         break;
       case WM_MOVE:
         term_notify_window_pos(wgs->term, LOWORD(lParam), HIWORD(lParam));
+        {
+            RECT r;
+            if (GetWindowRect(hwnd, &r)) {
+                conf_set_int(wgs->conf, CONF_window_xpos, r.left);
+                conf_set_int(wgs->conf, CONF_window_ypos, r.top);
+            }
+        }
         sys_cursor_update(wgs);
         break;
       case WM_SIZE:
@@ -3236,6 +3618,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
         noise_ultralight(NOISE_SOURCE_KEY, lParam);
 
         /*
+         * Once a session has fully closed, plain Enter restarts it,
+         * matching the quick reopen flow familiar from Kitty.
+         */
+        if (wgs->session_closed && !wgs->backend &&
+            (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+            wParam == VK_RETURN && !is_alt_pressed() &&
+            !(GetKeyState(VK_CONTROL) & 0x8000) &&
+            !(GetKeyState(VK_SHIFT) & 0x8000)) {
+            PostMessage(hwnd, WM_COMMAND, IDM_RESTART, 0);
+            return 0;
+        }
+
+        /*
          * We don't do TranslateMessage since it disassociates the
          * resulting CHAR message from the KEYDOWN that sparked it,
          * which we occasionally don't want. Instead, we process
@@ -3436,6 +3831,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                                    TO_CHR_Y(p.y), shift_pressed,
                                    control_pressed, is_alt_pressed());
                     } /* else: not sure when this can fail */
+                } else if (message != WM_MOUSEHWHEEL && control_pressed) {
+                    change_font_size(wgs, b == MBT_WHEEL_UP ? +1 : -1);
                 } else if (message != WM_MOUSEHWHEEL) {
                     /* trigger a scroll */
                     term_scroll(wgs->term, 0,
@@ -5452,6 +5849,14 @@ static void process_clipdata(WinGuiSeat *wgs, HGLOBAL clipdata, bool unicode)
     }
 
     sfree(clipboard_contents);
+}
+
+static bool wintw_open_url(TermWin *tw, const char *url)
+{
+    WinGuiSeat *wgs = container_of(tw, WinGuiSeat, termwin);
+    HINSTANCE ret = ShellExecuteA(wgs->term_hwnd, "open", url, NULL, NULL,
+                                  SW_SHOWDEFAULT);
+    return (INT_PTR)ret > 32;
 }
 
 static void wintw_clip_request_paste(TermWin *tw, int clipboard)

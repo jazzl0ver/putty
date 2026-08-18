@@ -15,6 +15,7 @@ void gui_term_process_cmdline(Conf *conf, char *cmdline)
 {
     char *p;
     bool special_launchable_argument = false;
+    bool force_config_box = false;
     bool demo_config_box = false;
 
     settings_set_default_protocol(be_default_protocol);
@@ -88,6 +89,8 @@ void gui_term_process_cmdline(Conf *conf, char *cmdline)
             } else if (!strcmp(p, "-pgpfp")) {
                 pgp_fingerprints_msgbox(NULL);
                 exit(0);
+            } else if (!strcmp(p, "-edit")) {
+                force_config_box = true;
             } else if (has_ca_config_box &&
                        (!strcmp(p, "-host-ca") || !strcmp(p, "--host-ca") ||
                         !strcmp(p, "-host_ca") || !strcmp(p, "--host_ca"))) {
@@ -146,7 +149,8 @@ void gui_term_process_cmdline(Conf *conf, char *cmdline)
          * Bring up the config dialog if the command line hasn't
          * (explicitly) specified a launchable configuration.
          */
-        if (!(special_launchable_argument || cmdline_host_ok(conf))) {
+        if (force_config_box ||
+            !(special_launchable_argument || cmdline_host_ok(conf))) {
             if (!do_config(conf))
                 cleanup_exit(0);
         }

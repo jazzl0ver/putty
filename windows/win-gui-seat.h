@@ -78,6 +78,7 @@ struct WinGuiSeat {
 
     struct unicode_data ucsdata;
     bool session_closed;
+    bool pending_restart;
     bool reconfiguring;
 
     const SessionSpecial *specials;
@@ -118,10 +119,13 @@ struct WinGuiSeat {
     int wheel_accumulator;
 
     bool pointer_indicates_raw_mouse;
+    bool pointer_indicates_url;
+    bool url_click_pending;
 
     BusyStatus busy_status;
 
     wchar_t *window_name, *icon_name;
+    bool hidden_to_launcher;
 
     int alt_numberpad_accumulator;
     int compose_state;

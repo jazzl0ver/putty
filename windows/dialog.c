@@ -415,9 +415,10 @@ static INT_PTR CALLBACK AboutProc(HWND hwnd, UINT msg,
         sfree(str);
         char *buildinfo_text = buildinfo("\r\n");
         char *text = dupprintf(
-            "%s\r\n\r\n%s\r\n\r\n%s\r\n\r\n%s",
+            "%s\r\n\r\n%s\r\n\r\n%s\r\n\r\n%s\r\n%s",
             appname, ver, buildinfo_text,
-            "\251 " SHORT_COPYRIGHT_DETAILS ". All rights reserved.");
+            "\251 " SHORT_COPYRIGHT_DETAILS ". All rights reserved.",
+            PATCHED_BY_DETAILS);
         sfree(buildinfo_text);
         SetDlgItemText(hwnd, IDA_TEXT, text);
         MakeDlgItemBorderless(hwnd, IDA_TEXT);
